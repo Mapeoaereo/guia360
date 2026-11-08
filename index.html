@@ -956,7 +956,7 @@
       }
     }
     const slot = (c, l) => { for (let k = 0; k < cnt[c]; k++) if (cI[c * MAXC + k] === l) return c * MAXC + k; return -1; };
-    const lam = job.seamData || 25, kap = job.seamConst || 1.5, BIG = 1e4;
+    const lam = job.seamData || 8, kap = job.seamConst || 1.5, BIG = 1e4;
     const Dc = (c, l) => { const s = slot(c, l); if (s < 0) return BIG; const e = cE[s]; return lam * (1 - e) + (e < 0.04 ? 200 : 0); };
     // costo de costura entre celdas c y d con fotos a y b
     const diff = (c, a, b) => { const sa = slot(c, a), sb = slot(c, b); if (sa < 0 || sb < 0) return BIG / 4;
@@ -972,7 +972,7 @@
     const stats = { seamCostBefore: +seamCost().toFixed(2) };
     let Ecur = energy(); const E0 = Ecur;
     const id = new Int32Array(NC);
-    for (let cycle = 0; cycle < (job.seamCycles || 1); cycle++) {
+    for (let cycle = 0; cycle < (job.seamCycles || 2); cycle++) {
       for (let a = 0; a < n; a++) {
         if (imgs[a].skip) continue;
         // nodos: celdas donde la foto a es candidata y hoy tienen otra etiqueta
@@ -1011,7 +1011,7 @@
           if (after > before + 1e-6) { for (const [c, l] of old) lab[c] = l; } else Ecur += after - before;
         }
       }
-      progress('Buscando costuras', (cycle + 1) / (job.seamCycles || 1));
+      progress('Buscando costuras', (cycle + 1) / (job.seamCycles || 2));
     }
     const T2 = Date.now();
     stats.seamCostAfter = +seamCost().toFixed(2); stats.energyDrop = +((1 - Ecur / E0) * 100).toFixed(1);
