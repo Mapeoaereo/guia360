@@ -493,6 +493,22 @@
   function denseMatches(job, cv, imgs, feats, s, maxAng) {
     const n = imgs.length, out = [], mats = [], cnt = { pairs: 0, det: 0, st: 0, fb: 0, big: 0, edge: 0, ok: 0 }; out.cnt = cnt;
     const getMat = i => mats[i] || (mats[i] = cv.matFromArray(feats[i].gh, feats[i].gw, cv.CV_8UC1, grayFrom(imgs[i]).gray));
+    const LV = job.denseLevels || 3, pyrs = [];
+    const pyr = m => { const L = [m]; for (let l = 1; l < LV; l++) { const d = new cv.Mat(); cv.pyrDown(L[l - 1], d); L.push(d); } return L; };
+    const getPyr = i => pyrs[i] || (pyrs[i] = pyr(getMat(i)));
+    const scalePts = (m, f) => { const a = Float32Array.from(m.data32F, v => v * f); return cv.matFromArray(m.rows, 1, cv.CV_32FC2, Array.from(a)); };
+    const track = (A, B, pts) => { // LK nivel 0 en cada escala, empezando por la más chica
+      let guess = null, st = null, er = null;
+      for (let l = LV - 1; l >= 0; l--) {
+        const f = 1 / (1 << l), src = scalePts(pts, f), nxt = guess ? scalePts(guess, 2) : scalePts(pts, f);
+        const s2 = new cv.Mat(), e2 = new cv.Mat();
+        cv.calcOpticalFlowPyrLK(A[l], B[l], src, nxt, s2, e2, win, 0, crit, cv.OPTFLOW_USE_INITIAL_FLOW, job.denseMinEig || 1e-4);
+        src.delete(); if (guess) guess.delete(); guess = nxt;
+        if (st) { for (let k = 0; k < s2.rows; k++) s2.data[k] = s2.data[k] && st.data[k]; st.delete(); er.delete(); }
+        st = s2; er = e2;
+      }
+      return { pts: guess, st, er };
+    };
     const proj = (P, w, f) => { const c = [dot(w, P.r), dot(w, P.u), dot(w, P.f)]; if (c[2] < 0.1) return null; const F = f.F * s; return [c[0] / c[2] * F + f.gw / 2, -c[1] / c[2] * F + f.gh / 2]; };
     const perPair = job.densePerPair || 400;
     const crit = new cv.TermCriteria(cv.TermCriteria_EPS | cv.TermCriteria_COUNT, 30, 0.01), win = new cv.Size(21, 21);
@@ -533,15 +549,17 @@
       mask.delete();
       if (pts.length < 20) { warped.delete(); continue; }
       const p0 = cv.matFromArray(pts.length / 2, 1, cv.CV_32FC2, pts); cnt.pairs++; cnt.det += pts.length / 2;
-      const p1 = new cv.Mat(), pb = new cv.Mat(), st = new cv.Mat(), st2 = new cv.Mat(), er = new cv.Mat(), er2 = new cv.Mat();
-      cv.calcOpticalFlowPyrLK(getMat(i), warped, p0, p1, st, er, win, 0, crit, 0, job.denseMinEig || 1e-4);
-      cv.calcOpticalFlowPyrLK(warped, getMat(i), p1, pb, st2, er2, win, 0, crit, 0, job.denseMinEig || 1e-4); // ida y vuelta: descarta seguimientos dudosos
+      // LK de grueso a fino con pirámide propia (la pirámide interna de OpenCV.js da resultados erróneos): alcanza ~40 px
+      const pyrW = pyr(warped), pyrI = getPyr(i);
+      const fw = track(pyrI, pyrW, p0), p1 = fw.pts, st = fw.st, er = fw.er;
+      const bw = track(pyrW, pyrI, p1), pb = bw.pts, st2 = bw.st, er2 = bw.er; // ida y vuelta: descarta seguimientos dudosos
+      pyrW.slice(1).forEach(m => m.delete());
       const a0 = p0.data32F, a1 = p1.data32F, ab = pb.data32F, cand = [];
       if (job.diag) { let f1 = 0, f2 = 0; for (let k = 0; k < p0.rows; k++) { if (!st.data[k]) f1++; else if (!st2.data[k]) f2++; } (cnt.per = cnt.per || []).push([i, j, p0.rows, f1, f2, Math.round(ang(imgs[i].f, imgs[j].f) * R2D)]); }
       for (let k = 0; k < p0.rows; k++) {
         if (!st.data[k] || !st2.data[k]) { cnt.st++; continue; }
         const dx = a1[2*k] - a0[2*k], dy = a1[2*k+1] - a0[2*k+1], fb = Math.hypot(ab[2*k] - a0[2*k], ab[2*k+1] - a0[2*k+1]);
-        if (fb > (job.denseFB || 1)) { cnt.fb++; continue; } if (Math.hypot(dx, dy) > 12) { cnt.big++; continue; }
+        if (fb > (job.denseFB || 1)) { cnt.fb++; continue; } if (Math.hypot(dx, dy) > 40) { cnt.big++; continue; }
         const q = mapH(a1[2*k], a1[2*k+1]);
         if (q[0] < 1 || q[1] < 1 || q[0] > B.gw - 2 || q[1] > B.gh - 2) { cnt.edge++; continue; } cnt.ok++;
         cand.push({ i, j, ax: a0[2*k], ay: a0[2*k+1], bx: q[0], by: q[1], d: er.data32F[k], dense: true });
@@ -549,6 +567,7 @@
       cand.sort((p, q) => p.d - q.d); cand.slice(0, perPair).forEach(c => out.push(c));
       [p0, p1, pb, st, st2, er, er2, warped].forEach(m => m.delete());
     }
+    pyrs.forEach(L => L && L.slice(1).forEach(m => m.delete()));
     mats.forEach(m => m && m.delete());
     return out;
   }
@@ -642,10 +661,13 @@
     // Gauss-Newton with Huber, gyro prior, image 0 fixed
     // Parámetros: rotación de cada foto (menos la 0), escala de focal compartida y distorsión compartida (k1, k2)
     const useK = job.distortion !== false;
-    const P = 3 * (n - 1) + 3, FI = P - 3, K1I = P - 2, K2I = P - 1;
+    // Foto 0 libre (con el mismo prior suave que las demás): si su inclinación medida venía mal, ya no la pagan todas las demás
+    const f0 = job.freeFirst === false ? 1 : 0;
+    const P = 3 * (n - f0) + 3, FI = P - 3, K1I = P - 2, K2I = P - 1;
     const acc = imgs.map(() => [0, 0, 0]);
     // Gravedad medida por el giroscopio en el marco de cada foto (componentes de "arriba" en r, u, f). Es confiable aunque el rumbo no.
-    const grav = imgs.map(im => [im.r[2], im.u[2], im.f[2]]);
+    let grav = imgs.map(im => [im.r[2], im.u[2], im.f[2]]);
+    const gyro0 = imgs.map(im => ({ r: im.r.slice(), u: im.u.slice(), f: im.f.slice() }));
     let s = 1, K = [0, 0];
     const wM = 1 / (0.002 * 0.002), wF = 1 / (0.08 * 0.08), huber = 0.003;
     const wTilt = 1 / Math.pow((job.tiltSigmaDeg || 0.5) * D2R, 2), wHead = 1 / Math.pow((job.headSigmaDeg || 5) * D2R, 2);
@@ -659,67 +681,104 @@
     };
     const errDeg = list => median(list.map(m => norm(resid(m, s, K).e))) * R2D;
     const before = errDeg(matches);
-    for (let it = 0; it < 14; it++) {
-      if (it === 5 || it === 9) {
-        const es = active.map(m => norm(resid(m, s, K).e)), md = median(es);
-        active = active.filter((m, k) => es[k] < Math.max(3 * md, 0.004));
-      }
+    const baStep = list => {
       const A = Array.from({ length: P }, () => new Float64Array(P)), b = new Float64Array(P);
-      for (const m of active) {
+      for (const m of list) {
         const { wa, wb, e } = resid(m, s, K);
         const num = (r1, h) => [(r1[0]-e[0])/h, (r1[1]-e[1])/h, (r1[2]-e[2])/h];
         const de = num(resid(m, s * (1 + 1e-4), K).e, s * 1e-4);
         const dk1 = num(resid(m, s, [K[0] + 1e-4, K[1]]).e, 1e-4), dk2 = num(resid(m, s, [K[0], K[1] + 1e-4]).e, 1e-4);
         const en = norm(e), w = wM * (en > huber ? huber / en : 1);
         const cols = []; // {idx, c:[3]}
-        if (m.i > 0) { const o = 3 * (m.i - 1); // -skew(wa) columns
+        if (m.i >= f0) { const o = 3 * (m.i - f0); // -skew(wa) columns
           cols.push({ idx: o, c: [0, -wa[2], wa[1]] }, { idx: o + 1, c: [wa[2], 0, -wa[0]] }, { idx: o + 2, c: [-wa[1], wa[0], 0] }); }
-        if (m.j > 0) { const o = 3 * (m.j - 1); // +skew(wb) columns
+        if (m.j >= f0) { const o = 3 * (m.j - f0); // +skew(wb) columns
           cols.push({ idx: o, c: [0, wb[2], -wb[1]] }, { idx: o + 1, c: [-wb[2], 0, wb[0]] }, { idx: o + 2, c: [wb[1], -wb[0], 0] }); }
         cols.push({ idx: FI, c: de }, { idx: K1I, c: dk1 }, { idx: K2I, c: dk2 });
         for (const p of cols) { b[p.idx] += w * dot(p.c, e); for (const q of cols) A[p.idx][q.idx] += w * dot(p.c, q.c); }
       }
       // Prior del giroscopio por eje del mundo: la inclinación (giros sobre ejes horizontales x, y) la mide bien la gravedad;
       // el rumbo (giro sobre el eje vertical z) no. Sin esta separación la esfera quedaba deformada (horizonte de −3° a +13°).
-      for (let i = 1; i < n; i++) for (let k = 0; k < 3; k++) {
-        const o = 3 * (i - 1) + k, wp = k === 2 ? (nearPole[i] ? wHead * 0.01 : wHead) : wTilt;
+      for (let i = f0; i < n; i++) for (let k = 0; k < 3; k++) {
+        const o = 3 * (i - f0) + k, wp = k === 2 ? (nearPole[i] ? wHead * 0.01 : wHead) : wTilt;
         A[o][o] += wp; b[o] += wp * acc[i][k]; }
       A[FI][FI] += wF; b[FI] += wF * (s - 1);
       A[K1I][K1I] += wK1; b[K1I] += wK1 * K[0]; A[K2I][K2I] += wK2; b[K2I] += wK2 * K[1];
       for (let k = 0; k < P; k++) A[k][k] *= 1.0001;
       const dx = solve(A.map(r => Array.from(r)), Array.from(b).map(v => -v));
-      for (let i = 1; i < n; i++) {
-        const d = [dx[3*(i-1)], dx[3*(i-1)+1], dx[3*(i-1)+2]];
+      for (let i = f0; i < n; i++) {
+        const d = [dx[3*(i-f0)], dx[3*(i-f0)+1], dx[3*(i-f0)+2]];
         const Pi = imgs[i]; Pi.r = rotVec(d, Pi.r); Pi.u = rotVec(d, Pi.u); Pi.f = rotVec(d, Pi.f); orthonorm(Pi);
         acc[i] = [acc[i][0] + d[0], acc[i][1] + d[1], acc[i][2] + d[2]];
       }
       s = Math.max(0.8, Math.min(1.25, s + dx[FI]));
       if (useK) K = [Math.max(-0.3, Math.min(0.3, K[0] + dx[K1I])), Math.max(-0.15, Math.min(0.15, K[1] + dx[K2I]))];
-      progress('Alineando', 0.7 + (it + 1) / 14 * 0.3);
+    };
+    const trim = list => { const es = list.map(m => norm(resid(m, s, K).e)), md = median(es); return list.filter((m, k) => es[k] < Math.max(3 * md, 0.004)); };
+    const runBA = (from, to) => { active = matches;
+      for (let it = 0; it < 14; it++) {
+        if (it === 5 || it === 9) active = trim(active);
+        baStep(active);
+        progress('Alineando', from + (it + 1) / 14 * (to - from));
+      } };
+    runBA(0.7, 0.82);
+    // Desfase fijo cámara↔sensores: en fotos reales del iPhone TODAS las fotos salían ~4° más inclinadas que lo que reporta el
+    // giroscopio (mismo giro en el marco de la cámara: recorte/estabilización del video). El prior de inclinación (0.5°) lo peleaba
+    // y torcía la esfera. Se ajusta d_i ≈ G_iᵀ·q (giro global) + c (desfase de cámara) y, si c es notable, se corrige el
+    // giroscopio de todas las fotos con c y se repite la alineación.
+    let camOffset = null; const gyroCur = gyro0.map(G => ({ r: G.r.slice(), u: G.u.slice(), f: G.f.slice() })), cTot = [0, 0, 0];
+    for (let round = 0; round < 3 && job.camOffset !== false; round++) {
+      const Am = Array.from({ length: 6 }, () => new Array(6).fill(0)), bm = new Array(6).fill(0); let used = 0;
+      for (let i = 0; i < n; i++) { if (nearPole[i]) continue; const G = gyroCur[i], Gb = [G.r, G.u, G.f], Fb = [imgs[i].r, imgs[i].u, imgs[i].f];
+        const D = Gb.map(a => Fb.map(b => dot(a, b))), d = [(D[2][1] - D[1][2]) / 2, (D[0][2] - D[2][0]) / 2, (D[1][0] - D[0][1]) / 2];
+        for (let a = 0; a < 3; a++) { const row = [Gb[a][0], Gb[a][1], Gb[a][2], a === 0 ? 1 : 0, a === 1 ? 1 : 0, a === 2 ? 1 : 0];
+          for (let p = 0; p < 6; p++) { bm[p] += row[p] * d[a]; for (let q = 0; q < 6; q++) Am[p][q] += row[p] * row[q]; } }
+        used++; }
+      if (used >= 6) {
+        for (let k = 0; k < 6; k++) Am[k][k] += 1e-9;
+        const x = solve(Am, bm), c = [x[3], x[4], x[5]], cDeg = norm(c) * R2D;
+        if (!(cDeg > (round ? 0.3 : (job.camOffsetMinDeg || 0.7)) && cDeg < 15)) break;
+        for (let k = 0; k < 3; k++) cTot[k] += c[k];
+        camOffset = { deg: +(norm(cTot) * R2D).toFixed(2), rfu: cTot.map(v => +(v * R2D).toFixed(2)), rounds: round + 1 };
+        {
+          for (let i = 0; i < n; i++) { const G = gyroCur[i], w = [0, 1, 2].map(k => -(c[0] * G.r[k] + c[1] * G.u[k] + c[2] * G.f[k]));
+            const P2 = { r: rotVec(w, G.r), u: rotVec(w, G.u), f: rotVec(w, G.f) }; orthonorm(P2);
+            imgs[i].r = P2.r; imgs[i].u = P2.u; imgs[i].f = P2.f; acc[i] = [0, 0, 0]; gyroCur[i] = { r: P2.r.slice(), u: P2.u.slice(), f: P2.f.slice() }; }
+          grav = imgs.map(im => [im.r[2], im.u[2], im.f[2]]); s = 1; K = [0, 0];
+          runBA(0.82, 0.94);
+        }
+      } else break;
+    }
+    // Segunda vuelta con puntos de flujo óptico: amarran las fotos de zonas lisas (techo, paredes blancas) que ORB dejó
+    // con pocos o ningún punto (Punto_03: una foto del techo con 0 puntos quedaba donde dijo el giroscopio).
+    let dense = [], denseInfo = null;
+    if (job.dense !== false && cv.calcOpticalFlowPyrLK) {
+      try {
+        progress('Afinando zonas lisas', 0.95);
+        const dn = denseMatches(job, cv, imgs, feats, s, 2 * vHalf * 0.95);
+        dense = dn.filter(m => norm(resid(m, s, K).e) < 3 * D2R);
+        denseInfo = Object.assign({ raw: dn.length }, dn.cnt);
+        if (dense.length && job.denseBA !== false) for (let it = 0; it < 6; it++) { if (it === 2) dense = trim(dense); baStep(active.concat(dense)); }
+      } catch (e) { denseInfo = { error: String(e && e.message || e) }; }
     }
     // Nivelar: la alineación solo cuida que las fotos coincidan entre sí; la orientación del conjunto quedaba amarrada a la foto 0
     // y podía ladearse varios grados (fotos reales: horizonte entre −3° y +13°). Se gira toda la esfera para que su "arriba"
     // coincida con la gravedad promedio de todas las fotos: z' = promedio de C_i·g_i (robusto: se descartan las que discrepan).
     const level = levelToGravity(imgs, grav, job.level !== false);
     // Fotos del cenit/nadir que quedaron con poco apoyo: alinearlas mal duplica objetos (p. ej. la lámpara); mejor no usarlas
-    const support = new Array(n).fill(0); for (const m of active) { support[m.i]++; support[m.j]++; }
+    const support = new Array(n).fill(0); for (const m of active.concat(dense)) { support[m.i]++; support[m.j]++; }
     const dropped = [];
     for (let i = 1; i < n; i++) if (nearPole[i] && support[i] < (job.minPoleSupport ?? 15)) { imgs[i].skip = true; dropped.push(i); }
-    const out = { ok: true, corrDeg: acc.map(v => v.map(x => +(x * R2D).toFixed(2))), matches: matches.length, used: active.length, pairs: pairCount, errBeforeDeg: before, errAfterDeg: errDeg(active), focalScale: s, k: K, support, dropped, level };
+    const out = { ok: true, camOffset, corrDeg: acc.map(v => v.map(x => +(x * R2D).toFixed(2))), matches: matches.length, used: active.length, pairs: pairCount, errBeforeDeg: before, errAfterDeg: errDeg(active), focalScale: s, k: K, support, dropped, level };
     // Ajuste fino local (malla flexible por foto) para absorber el paralaje que un giro rígido no puede corregir
     const evalHeld = () => held.length ? median(held.map(m => norm(resid(m, s, K).e))) * R2D : null;
     if (held.length) out.heldBeforeDeg = evalHeld();
     if (job.mesh !== false) {
       progress('Ajuste fino', 0.97);
-      let meshMatches = active;
-      if (job.dense !== false && cv.calcOpticalFlowPyrLK) {
-        try {
-          const dn = denseMatches(job, cv, imgs, feats, s, 2 * vHalf * 0.95);
-          // se quedan solo los que el modelo rígido ya casi explica (lo demás son reflejos o cosas que se movieron)
-          const ok = dn.filter(m => norm(resid(m, s, K).e) < 1.5 * D2R);
-          meshMatches = active.concat(ok); out.dense = ok.length; out.denseCnt = Object.assign({ raw: dn.length }, dn.cnt);
-        } catch (e) { out.denseError = String(e && e.message || e); }
-      }
+      // se quedan solo los densos que el modelo rígido ya casi explica (lo demás son reflejos o cosas que se movieron)
+      const ok = dense.filter(m => norm(resid(m, s, K).e) < 1.5 * D2R);
+      const meshMatches = ok.length ? active.concat(ok) : active;
+      out.dense = ok.length; out.denseCnt = denseInfo;
       const mres = meshWarp(job, feats, imgs, meshMatches, s, K);
       out.mesh = mres;
       out.errMeshDeg = errDeg(active);
@@ -962,7 +1021,7 @@
       let m = new Float32Array(NC), any = false; for (let c = 0; c < NC; c++) if (lab[c] === i) { m[c] = 1; any = true; }
       if (!any) continue;
       const tmp = new Float32Array(NC);
-      for (let pass = 0; pass < 2; pass++) {
+      for (let pass = 0; pass < (job.seamBlur || 2); pass++) {
         for (let y = 0; y < GH; y++) for (let x = 0; x < GW; x++) tmp[y*GW + x] = (m[y*GW + (x + GW - 1) % GW] + m[y*GW + x] + m[y*GW + (x + 1) % GW]) / 3;
         for (let y = 0; y < GH; y++) for (let x = 0; x < GW; x++) m[y*GW + x] = (tmp[Math.max(0, y - 1)*GW + x] + tmp[y*GW + x] + tmp[Math.min(GH - 1, y + 1)*GW + x]) / 3;
       }
