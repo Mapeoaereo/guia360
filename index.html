@@ -5,6 +5,10 @@
 <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no, viewport-fit=cover">
 <meta name="theme-color" content="#000000">
 <meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-title" content="Guía 360">
+<link rel="manifest" href="manifest.webmanifest">
+<link rel="apple-touch-icon" href="icon-192.png">
 <title>Guía 360</title>
 <style>
   :root { --ok:#2ee59d; --next:#ffb020; --bad:#ff5a5a; --bg:#000; --panel:rgba(18,18,22,.92); --txt:#f2f2f2; --mut:#9a9aa5; }
@@ -75,8 +79,15 @@
   <h1>Guía 360</h1>
   <p>Te marca en pantalla a dónde apuntar el cel para cubrir toda la habitación, dispara sola cuando estás alineado y te muestra en el minimapa qué zonas faltan.</p>
   <p>Úsala con el cel en <b>vertical</b> y montado en el tripié.</p>
+  <div id="recoverBox" style="display:none; background:#ffb02022; border:1px solid var(--next); border-radius:14px; padding:12px; margin:0 0 14px; max-width:420px">
+    <p id="recoverText" style="color:var(--txt); margin:0 0 10px"></p>
+    <div class="btns"><button id="btnRecoverDrop">Descartar</button><button id="btnRecover" class="primary">Recuperar</button></div>
+  </div>
   <button id="btnEnable" class="primary">Activar cámara y sensores</button>
   <p id="err"></p>
+  <button id="btnLoadZip" style="margin-top:6px; background:transparent; border:1px solid #ffffff33">Crear 360 desde un ZIP</button>
+  <input id="inZip" type="file" accept=".zip,application/zip" style="display:none">
+  <p class="note" id="offlineStart" style="margin-top:14px"></p>
 </div>
 
 <div id="topbar">
@@ -134,6 +145,10 @@
     <span class="note">El tripié inclina menos el cel: el piso y el techo salen más centrados y con menos paralaje, a cambio de ~3 tomas más.</span></div>
   <div class="row inline"><label>Incluir foto del piso (nadir)</label><input id="inNadir" type="checkbox"></div>
   <div class="row"><div id="plansum"></div></div>
+  <div class="row"><label>Uso sin internet</label>
+    <div id="offlineStatus" class="note" style="color:var(--txt)">Revisando…</div>
+    <button id="btnOffline">Preparar para usar sin internet</button>
+    <span class="note">Hazlo con señal antes de salir: guarda la app y el motor de alineación (~10 MB) en el cel. En iPhone, abre la app desde Safari y usa Compartir → Agregar a inicio; así iOS no borra lo guardado.</span></div>
   <span class="note">Cambiar lente, campo de visión, traslape, patrón o nadir reinicia el punto actual.</span>
   <div class="btns" style="margin-top:14px"><button id="btnCloseSettings" class="primary">Listo</button></div>
 </div>
@@ -576,7 +591,7 @@ self.onmessage = async (e) => {
   const job = e.data; let cv = null;
   if (job.refine) {
     self.postMessage({ type: 'progress', stage: 'Cargando motor de alineación', pct: 0 });
-    for (const url of job.cvUrls) { try { importScripts(url); cv = (await waitCv()).cv; break; } catch (err) { cv = null; } }
+    for (const url of job.cvUrls) { try { importScripts(url); cv = (await waitCv()).cv; self.postMessage({ type: 'cvsrc', src: url.startsWith('blob:') ? 'cache' : 'red' }); break; } catch (err) { cv = null; } }
     if (!cv) self.postMessage({ type: 'warn', msg: 'No se pudo cargar OpenCV (¿sin internet?). Se unirá solo con el giroscopio.' });
   }
   try {
@@ -741,7 +756,8 @@ const S = {
   stream: null, track: null, orient: null, lastOrientAt: 0, history: [],
   started: false, yaw0: 0, plan: null, shots: [], captured: new Set(),
   busy: false, alignedSince: 0, alignedIdx: -1,
-  calib: null, wakeLock: null, audio: null, aeLocked: false
+  calib: null, wakeLock: null, audio: null, aeLocked: false,
+  fovOverride: null, external: null, externalTotal: 0
 };
 const cfg = { longFov: 100, ov: 0.30, tol: 3, auto: true, nadir: false, pattern: 'tripod', lens: 'uw', res: 'max', autoLock: true, cam: {}, outW: 5760, refine: true };
 try { Object.assign(cfg, JSON.parse(localStorage.getItem('guia360cfg') || '{}')); } catch (e) {}
@@ -752,6 +768,7 @@ function frameDims() {
   return { w, h };
 }
 function fovs() {
+  if (S.fovOverride) return S.fovOverride;
   const { w, h } = frameDims();
   const H = shortFov(cfg.longFov, w, h);
   return { H, V: cfg.longFov };
@@ -798,6 +815,7 @@ async function enable() {
     window.addEventListener('deviceorientation', onOrient);
     try { S.audio = new (window.AudioContext || window.webkitAudioContext)(); } catch (e) {}
     if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) throw new Error('Este navegador no da acceso a la cámara. Ábrela desde HTTPS en Chrome (Android) o Safari (iPhone).');
+    clearExternal();
     await openCamera(null);
     await listCameras();
     $('start').style.display = 'none';
@@ -944,7 +962,9 @@ function nextTargetIdx(pose) {
 async function startPoint() {
   const pose = currentPose();
   if (!pose) { $('hint').textContent = 'Esperando giroscopio…'; return; }
+  clearExternal();
   S.yaw0 = pose.yaw; S.started = true; S.shots = []; S.captured = new Set(); resetStitchUI();
+  dbClearPoint().then(dbSaveMeta);
   if (cfg.autoLock && !Object.keys(cfg.cam).length) {
     await setCameraMode('continuous');
     await new Promise(r => setTimeout(r, 600)); // let AE settle on this room
@@ -969,11 +989,13 @@ async function capture(targetIdx) {
       targetIdx = best;
     }
     S.shots.push({
+      id: Date.now().toString(36) + Math.random().toString(36).slice(2, 7),
       blob, width: w, height: h, target: targetIdx,
       yaw: wrap180(pose.yaw - S.yaw0), pitch: pose.pitch, roll: pose.roll,
       f: pose.f, r: pose.r, u: pose.u
     });
     if (targetIdx >= 0) S.captured.add(targetIdx);
+    dbSaveShot(S.shots[S.shots.length - 1], S.shots.length - 1);
     if (PANO || stitchWorker) resetStitchUI();
     $('flash').style.opacity = .55; setTimeout(() => $('flash').style.opacity = 0, 90);
     if (navigator.vibrate) navigator.vibrate(40);
@@ -985,6 +1007,7 @@ async function capture(targetIdx) {
 function undo() {
   const s = S.shots.pop(); if (!s) return;
   if (s.target >= 0) S.captured.delete(s.target);
+  if (s.id) safeDb(dbDo('shots', 'readwrite', st => st.delete(s.id)));
   if (PANO || stitchWorker) resetStitchUI();
   drawMinimapBase(); updateProgress();
 }
@@ -1190,14 +1213,15 @@ async function buildZip() {
     const s = shots[i];
     const file = `${base}_${String(i + 1).padStart(2, '0')}.jpg`;
     files.push({ name: `${base}/${file}`, data: new Uint8Array(await s.blob.arrayBuffer()) });
-    shotsMeta.push({ file, yaw: +s.yaw.toFixed(3), pitch: +s.pitch.toFixed(3), roll: +s.roll.toFixed(3), width: s.width, height: s.height });
+    const v6 = a => a ? a.map(x => +x.toFixed(6)) : undefined;
+    shotsMeta.push({ file, yaw: +s.yaw.toFixed(3), pitch: +s.pitch.toFixed(3), roll: +s.roll.toFixed(3), width: s.width, height: s.height, f: v6(s.f), r: v6(s.r), u: v6(s.u) });
   }
   const { H, V } = fovs();
   const meta = {
     point: $('inPoint').value, created: new Date().toISOString(),
     camera: $('inCam').selectedOptions[0] ? $('inCam').selectedOptions[0].textContent : '',
-    hfov_deg: +H.toFixed(3), vfov_deg: +V.toFixed(3), overlap: cfg.ov, exposure_locked: S.aeLocked,
-    note: 'yaw relativo a la primera dirección (positivo = a la derecha), pitch positivo = arriba',
+    hfov_deg: +H.toFixed(3), vfov_deg: +V.toFixed(3), overlap: cfg.ov, exposure_locked: S.aeLocked, yaw0_deg: +S.yaw0.toFixed(4),
+    note: 'yaw relativo a la primera dirección (positivo = a la derecha), pitch positivo = arriba. f/r/u = adelante/derecha/arriba de la cámara en el mundo (x=Este, y=Norte, z=Arriba), sin restar yaw0_deg',
     shots: shotsMeta
   };
   const enc = new TextEncoder();
@@ -1226,15 +1250,19 @@ async function shareZip() {
 }
 function showDone() {
   const mb = S.shots.reduce((a, s) => a + s.blob.size, 0) / 1048576;
-  $('doneTitle').textContent = S.captured.size === S.plan.targets.length ? 'Punto completo' : 'Exportar punto';
-  $('doneInfo').textContent = `${S.shots.length} fotos · ${mb.toFixed(1)} MB · exposición ${S.aeLocked ? 'bloqueada' : 'automática (puede variar entre fotos)'}`;
+  const total = S.external ? S.externalTotal : (S.plan ? S.plan.targets.length : S.shots.length);
+  $('doneTitle').textContent = S.external === 'zip' ? 'Punto desde ZIP' : S.external === 'recover' ? 'Punto recuperado' : S.captured.size === total ? 'Punto completo' : 'Exportar punto';
+  $('btnRetake').style.display = S.external ? 'none' : ''; $('btnNext').style.display = S.external ? 'none' : '';
+  $('doneInfo').textContent = S.external
+    ? `${S.shots.length} fotos · ${mb.toFixed(1)} MB · ${S.external === 'zip' ? 'cargado desde el ZIP' : 'recuperado de la memoria del cel'}. Puedes crear la 360 y descargarla; para tomar más fotos, inicia un punto nuevo.`
+    : `${S.shots.length} fotos · ${mb.toFixed(1)} MB · exposición ${S.aeLocked ? 'bloqueada' : 'automática (puede variar entre fotos)'}`;
   openSheet('done'); beep(1040);
 }
 function nextPoint() {
   const v = $('inPoint').value, m = v.match(/^(.*?)(\d+)\s*$/);
   $('inPoint').value = m ? m[1] + String(+m[2] + 1).padStart(m[2].length, '0') : v + ' 2';
   $('pname').textContent = $('inPoint').value;
-  closeSheet('done');
+  closeSheet('done'); dbClearPoint();
   if (!Object.keys(cfg.cam).length) setCameraMode('continuous');
   S.aeLocked = false; updateAEChip(); resetStitchUI(); resetPoint();
 }
@@ -1244,7 +1272,7 @@ const CV_URLS = [
   'https://cdn.jsdelivr.net/npm/@techstark/opencv-js@4.10.0-release.1/dist/opencv.js',
   'https://unpkg.com/@techstark/opencv-js@4.10.0-release.1/dist/opencv.js'
 ];
-let PANO = null, stitchWorker = null;
+let PANO = null, stitchWorker = null, cvSrc = '';
 function resetStitchUI() {
   PANO = null;
   if (stitchWorker) { stitchWorker.terminate(); stitchWorker = null; }
@@ -1288,16 +1316,19 @@ async function startStitch() {
     }
     const blob = new Blob([$('stitchWorkerSrc').textContent], { type: 'text/javascript' });
     stitchWorker = new Worker(URL.createObjectURL(blob));
-    const t0 = Date.now(); let warn = '';
+    const t0 = Date.now(); let warn = ''; cvSrc = '';
     stitchWorker.onmessage = e => {
       const m = e.data;
       if (m.type === 'progress') setProg(m.stage + '…', m.pct);
       else if (m.type === 'warn') warn = m.msg;
+      else if (m.type === 'cvsrc') cvSrc = m.src;
       else if (m.type === 'error') { setProg('Error: ' + m.msg, 0); $('btnStitch').style.display = ''; stitchWorker.terminate(); stitchWorker = null; }
       else if (m.type === 'done') { stitchWorker.terminate(); stitchWorker = null; finishStitch(m, (Date.now() - t0) / 1000, warn); }
     };
     stitchWorker.onerror = e => { setProg('Error en el proceso: ' + (e.message || 'memoria insuficiente'), 0); $('btnStitch').style.display = ''; if (stitchWorker) { stitchWorker.terminate(); stitchWorker = null; } };
-    stitchWorker.postMessage({ outW, refine: cfg.refine, hfov: H, images, cvUrls: CV_URLS }, transfer);
+    const cvUrls = cfg.refine ? await cvSources() : CV_URLS;
+    stitchWorker.postMessage({ outW, refine: cfg.refine, hfov: H, images, cvUrls }, transfer);
+    if (cvUrls[0].startsWith('blob:')) setTimeout(() => URL.revokeObjectURL(cvUrls[0]), 120000);
   } catch (err) {
     setProg('Error: ' + (err.message || err), 0); $('btnStitch').style.display = '';
   }
@@ -1315,6 +1346,7 @@ function finishStitch(m, secs, warn) {
   info += r.ok ? `alineación afinada (error ${r.errBeforeDeg.toFixed(1)}° → ${r.errAfterDeg.toFixed(2)}°, ${r.used} puntos)` : `solo giroscopio (${r.reason || 'sin afinar'})`;
   const vg = m.stats.vignette || [0, 0], fall = Math.round((1 - Math.exp(vg[0] + vg[1])) * 100);
   info += fall > 0 ? ` · viñeteo corregido (orillas −${fall}%)` : ' · sin corrección de viñeteo';
+  if (cvSrc === 'cache') info += ' · motor guardado en el cel';
   if (warn) info += ' · ' + warn;
   $('stitchInfo').textContent = info;
   $('stitchProg').style.display = 'none'; $('stitchResult').style.display = '';
@@ -1389,6 +1421,158 @@ async function sharePano() {
   else $('stitchInfo').textContent = 'Compartir no está disponible aquí; usa Descargar JPG 360.';
 }
 
+// ---------- Uso sin internet ----------
+// La app se guarda con el service worker (sw.js). El motor de alineación se guarda aparte en Cache Storage y se le pasa
+// al worker como blob, así no depende de que el worker pase por el service worker (Safari no siempre lo hace).
+const CV_CACHE = 'guia360-opencv-v1';
+let offlineBusy = false, offlineMsg = '';
+const isIOS = /iP(hone|ad|od)/.test(navigator.userAgent) || (navigator.platform === 'MacIntel' && navigator.maxTouchPoints > 1);
+const isStandalone = () => (window.matchMedia && matchMedia('(display-mode: standalone)').matches) || navigator.standalone === true;
+async function offlineState() {
+  const st = { sw: 'serviceWorker' in navigator, cachesApi: typeof caches !== 'undefined', shell: false, cv: false };
+  try { if (st.sw) { const reg = await navigator.serviceWorker.getRegistration(); st.shell = !!(reg && reg.active) && !!(await caches.match('./index.html', { ignoreSearch: true })); } } catch (e) {}
+  try { if (st.cachesApi) st.cv = !!(await (await caches.open(CV_CACHE)).match(CV_URLS[0])); } catch (e) {}
+  return st;
+}
+async function renderOffline() {
+  const st = await offlineState(); let txt, ok = false;
+  if (!st.cachesApi) txt = '❌ Este navegador no permite guardar la app. En iPhone ábrela en Safari y usa Compartir → Agregar a inicio.';
+  else if (offlineBusy) txt = '⬇ Descargando el motor de alineación (~10 MB)…';
+  else if (st.shell && st.cv) { ok = true; txt = '✅ Lista para usar sin internet'; if (isIOS && !isStandalone()) txt += ' · Agrégala a inicio desde Safari para que iOS no la borre'; }
+  else {
+    const falta = [!st.shell && (st.sw ? 'la app' : 'la app (este navegador no la puede guardar; usa Safari)'), !st.cv && 'el motor de alineación'].filter(Boolean).join(' y ');
+    txt = `⚠ Sin internet todavía no funciona: falta guardar ${falta}. ${navigator.onLine ? 'Toca "Preparar".' : 'Necesitas señal para prepararla.'}`;
+  }
+  if (offlineMsg) txt += ' · ' + offlineMsg;
+  $('offlineStatus').textContent = txt; $('offlineStart').textContent = txt;
+  $('offlineStatus').style.color = ok ? 'var(--ok)' : 'var(--txt)';
+  return ok;
+}
+async function prepareOffline(manual) {
+  if (offlineBusy) return; offlineBusy = true; offlineMsg = ''; renderOffline();
+  let swErr = '';
+  try {
+    // El service worker y el motor se preparan por separado: si el navegador no permite service workers,
+    // al menos el motor queda guardado (la unión funciona sin señal si la app ya está abierta)
+    if ('serviceWorker' in navigator) {
+      try { await navigator.serviceWorker.register('sw.js'); await Promise.race([navigator.serviceWorker.ready, new Promise(r => setTimeout(r, 8000))]); }
+      catch (e) { swErr = 'este navegador no deja guardar la app'; }
+    }
+    if (typeof caches !== 'undefined') {
+      const c = await caches.open(CV_CACHE);
+      if (!(await c.match(CV_URLS[0]))) {
+        let ok = false;
+        for (const u of CV_URLS) { try { const r = await fetch(u, { mode: 'cors' }); if (r.ok) { await c.put(CV_URLS[0], r); ok = true; break; } } catch (e) {} }
+        if (!ok) throw new Error('no se pudo descargar el motor (¿sin señal?)');
+      }
+    }
+    if (navigator.storage && navigator.storage.persist) { try { await navigator.storage.persist(); } catch (e) {} }
+  } catch (e) { offlineMsg = (manual ? 'Error: ' : '') + (e.message || e); }
+  finally { if (swErr) offlineMsg = offlineMsg ? offlineMsg + ' · ' + swErr : swErr; offlineBusy = false; renderOffline(); }
+}
+// Fuentes de OpenCV para el worker: primero la copia guardada (como blob), luego la red
+async function cvSources() {
+  try {
+    const hit = typeof caches !== 'undefined' && await (await caches.open(CV_CACHE)).match(CV_URLS[0]);
+    if (hit) { const b = await hit.blob(); return [URL.createObjectURL(new Blob([b], { type: 'text/javascript' })), ...CV_URLS]; }
+  } catch (e) {}
+  return CV_URLS.slice();
+}
+
+// ---------- Guardar cada foto en el cel (IndexedDB) para recuperar el punto si la página se recarga ----------
+let dbP = null;
+function db() {
+  if (!dbP) dbP = new Promise((res, rej) => {
+    const r = indexedDB.open('guia360', 1);
+    r.onupgradeneeded = () => { const d = r.result; d.createObjectStore('shots', { keyPath: 'id' }); d.createObjectStore('meta'); };
+    r.onsuccess = () => res(r.result); r.onerror = () => rej(r.error);
+  });
+  return dbP;
+}
+async function dbDo(store, mode, fn) {
+  const d = await db();
+  return new Promise((res, rej) => { const t = d.transaction(store, mode), req = fn(t.objectStore(store)); t.oncomplete = () => res(req && req.result); t.onerror = () => rej(t.error); t.onabort = () => rej(t.error); });
+}
+const safeDb = p => p.catch(e => { console.warn('IndexedDB', e); });
+function dbClearPoint() { return safeDb(Promise.all([dbDo('shots', 'readwrite', s => s.clear()), dbDo('meta', 'readwrite', s => s.clear())])); }
+function dbSaveMeta() {
+  const { H, V } = fovs();
+  return safeDb(dbDo('meta', 'readwrite', s => s.put({ point: $('inPoint').value, yaw0: S.yaw0, H, V, total: S.plan ? S.plan.targets.length : 0, created: Date.now() }, 'point')));
+}
+function dbSaveShot(s, idx) {
+  return safeDb(dbDo('shots', 'readwrite', st => st.put({ id: s.id, idx, blob: s.blob, width: s.width, height: s.height, target: s.target, yaw: s.yaw, pitch: s.pitch, roll: s.roll, f: s.f, r: s.r, u: s.u })));
+}
+async function checkRecover() {
+  try {
+    const meta = await dbDo('meta', 'readonly', s => s.get('point')), shots = await dbDo('shots', 'readonly', s => s.getAll());
+    if (!meta || !shots || !shots.length) return;
+    shots.sort((a, b) => a.idx - b.idx);
+    const mins = Math.round((Date.now() - meta.created) / 60000), hace = mins < 60 ? `hace ${mins} min` : `hace ${Math.round(mins / 60)} h`;
+    $('recoverText').textContent = `Hay un punto sin terminar: ${meta.point}, ${shots.length} fotos (${hace}).`;
+    $('recoverBox').style.display = '';
+    $('btnRecover').onclick = () => { $('recoverBox').style.display = 'none'; loadExternalPoint({ kind: 'recover', name: meta.point, H: meta.H, V: meta.V, yaw0: meta.yaw0, total: meta.total, shots }); };
+    $('btnRecoverDrop').onclick = async () => { if (!confirm(`¿Borrar las ${shots.length} fotos guardadas de ${meta.point}? No se puede deshacer.`)) return; await dbClearPoint(); $('recoverBox').style.display = 'none'; };
+  } catch (e) { console.warn('recuperar', e); }
+}
+
+// ---------- Punto externo (recuperado o cargado desde un ZIP): se puede unir y exportar, sin cámara ----------
+function loadExternalPoint(p) {
+  S.shots = p.shots.map(s => ({ id: s.id, blob: s.blob, width: s.width, height: s.height, target: s.target == null ? -1 : s.target, yaw: s.yaw || 0, pitch: s.pitch || 0, roll: s.roll || 0, f: s.f, r: s.r, u: s.u }));
+  S.captured = new Set(S.shots.map(s => s.target).filter(t => t >= 0));
+  S.yaw0 = p.yaw0 || 0; S.fovOverride = { H: p.H, V: p.V }; S.external = p.kind; S.externalTotal = p.total || S.shots.length; S.started = false;
+  $('inPoint').value = p.name || 'Punto'; $('pname').textContent = $('inPoint').value;
+  $('start').style.display = 'none'; resetStitchUI(); showDone();
+}
+function clearExternal() { if (S.external) { S.external = null; S.fovOverride = null; S.shots = []; S.captured = new Set(); } }
+// Pose desde yaw/pitch/roll (ZIP viejos sin f/r/u): igual que poseOf(), con roll = asin(r_z) y u = r × f
+function poseFromYPR(yaw, pitch, roll) {
+  const f = dirFrom(yaw, pitch), y = yaw * D2R, p = pitch * D2R;
+  const r0 = [Math.cos(y), -Math.sin(y), 0], u0 = [r0[1]*f[2]-r0[2]*f[1], r0[2]*f[0]-r0[0]*f[2], r0[0]*f[1]-r0[1]*f[0]];
+  const th = Math.asin(clamp1(Math.sin(roll * D2R) / Math.max(1e-6, Math.cos(p))));
+  let r = r0.map((v, k) => v * Math.cos(th) + u0[k] * Math.sin(th)); const n = Math.hypot(...r); r = r.map(v => v / n);
+  return { f, r, u: [r[1]*f[2]-r[2]*f[1], r[2]*f[0]-r[0]*f[2], r[0]*f[1]-r[1]*f[0]] };
+}
+// Lector de ZIP: sin compresión (los que arma la app) o deflate (si se volvió a comprimir), con DecompressionStream
+function readZip(buf) {
+  const dv = new DataView(buf.buffer, buf.byteOffset, buf.byteLength);
+  let e = buf.length - 22; while (e >= 0 && dv.getUint32(e, true) !== 0x06054b50) e--;
+  if (e < 0) throw new Error('El archivo no es un ZIP válido.');
+  const count = dv.getUint16(e + 10, true), dec = new TextDecoder(), out = {};
+  let p = dv.getUint32(e + 16, true);
+  for (let i = 0; i < count; i++) {
+    if (dv.getUint32(p, true) !== 0x02014b50) throw new Error('El ZIP está dañado.');
+    const method = dv.getUint16(p + 10, true), csize = dv.getUint32(p + 20, true), nlen = dv.getUint16(p + 28, true), xlen = dv.getUint16(p + 30, true), clen = dv.getUint16(p + 32, true), lo = dv.getUint32(p + 42, true);
+    const name = dec.decode(buf.subarray(p + 46, p + 46 + nlen)), ds = lo + 30 + dv.getUint16(lo + 26, true) + dv.getUint16(lo + 28, true);
+    out[name] = { method, data: buf.subarray(ds, ds + csize) };
+    p += 46 + nlen + xlen + clen;
+  }
+  return out;
+}
+async function zipBytes(ent) {
+  if (ent.method === 0) return ent.data;
+  if (ent.method === 8 && typeof DecompressionStream !== 'undefined') return new Uint8Array(await new Response(new Blob([ent.data]).stream().pipeThrough(new DecompressionStream('deflate-raw'))).arrayBuffer());
+  throw new Error('El ZIP usa una compresión que este navegador no puede abrir.');
+}
+async function loadZipFile(file) {
+  $('err').textContent = 'Abriendo ZIP…';
+  try {
+    const ents = readZip(new Uint8Array(await file.arrayBuffer()));
+    const capName = Object.keys(ents).find(n => /(^|\/)capture\.json$/.test(n));
+    if (!capName) throw new Error('El ZIP no trae capture.json. ¿Es un ZIP de Guía 360?');
+    const dir = capName.slice(0, capName.length - 'capture.json'.length);
+    const meta = JSON.parse(new TextDecoder().decode(await zipBytes(ents[capName])));
+    const shots = [];
+    for (const s of meta.shots) {
+      const ent = ents[dir + s.file]; if (!ent) throw new Error(`Falta ${s.file} en el ZIP.`);
+      const pose = s.f && s.r && s.u ? { f: s.f, r: s.r, u: s.u } : poseFromYPR(s.yaw, s.pitch, s.roll);
+      shots.push(Object.assign({ blob: new Blob([await zipBytes(ent)], { type: 'image/jpeg' }), width: s.width, height: s.height, target: -1, yaw: s.yaw, pitch: s.pitch, roll: s.roll }, pose));
+    }
+    if (shots.length < 3) throw new Error('El ZIP trae menos de 3 fotos.');
+    $('err').textContent = '';
+    loadExternalPoint({ kind: 'zip', name: meta.point, H: meta.hfov_deg, V: meta.vfov_deg, yaw0: shots[0].f && meta.shots[0].f ? (meta.yaw0_deg || 0) : 0, shots });
+  } catch (e) { $('err').textContent = e.message || String(e); }
+}
+
 // ---------- UI wiring ----------
 // Menús: se cierran con ✕, tocando fuera del menú o con el botón "atrás" del cel (Android / gesto de iOS).
 const anySheetOpen = () => !!document.querySelector('.sheet.open');
@@ -1399,10 +1583,11 @@ function openSheet(id) {
 }
 function closeSheet(id) {
   $(id).classList.remove('open'); syncBackdrop();
+  if (id === 'done' && !S.stream) { $('start').style.display = ''; renderOffline(); }
   // Si ya no queda ningún menú abierto, quitar la entrada del historial (se revisa después porque a veces se abre otro enseguida)
   setTimeout(() => { if (!anySheetOpen() && history.state && history.state.sheet) history.back(); }, 0);
 }
-window.addEventListener('popstate', () => { document.querySelectorAll('.sheet.open').forEach(s => s.classList.remove('open')); syncBackdrop(); });
+window.addEventListener('popstate', () => { document.querySelectorAll('.sheet.open').forEach(s => s.classList.remove('open')); syncBackdrop(); if (!S.stream) $('start').style.display = ''; });
 document.querySelectorAll('[data-close]').forEach(b => b.onclick = () => closeSheet(b.dataset.close));
 $('backdrop').onclick = () => document.querySelectorAll('.sheet.open').forEach(s => closeSheet(s.id));
 $('btnEnable').onclick = enable;
@@ -1444,6 +1629,14 @@ $('inOv').oninput = e => { cfg.ov = +e.target.value / 100; $('ovVal').textConten
 $('inTol').oninput = e => { cfg.tol = +e.target.value; $('tolVal').textContent = e.target.value; saveCfg(); };
 $('inAuto').onchange = e => { cfg.auto = e.target.checked; saveCfg(); };
 $('inNadir').onchange = e => { cfg.nadir = e.target.checked; saveCfg(); resetPoint(); };
+$('btnOffline').onclick = () => prepareOffline(true);
+$('btnLoadZip').onclick = () => $('inZip').click();
+$('inZip').onchange = e => { const f = e.target.files && e.target.files[0]; e.target.value = ''; if (f) loadZipFile(f); };
+window.addEventListener('online', () => prepareOffline(false));
+// Al abrir: registrar el modo sin internet y, si hay señal, dejarlo listo solo (descarga ~10 MB una vez)
+if ('serviceWorker' in navigator) navigator.serviceWorker.register('sw.js').catch(() => {});
+renderOffline().then(ok => { if (!ok && navigator.onLine) setTimeout(() => prepareOffline(false), 2500); });
+checkRecover();
 $('inPattern').onchange = e => { cfg.pattern = e.target.value; saveCfg(); resetPoint(); };
 
 // restore cfg into UI
