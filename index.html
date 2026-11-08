@@ -486,6 +486,73 @@
   }
   const median = a => { if (!a.length) return 0; const s = a.slice().sort((x, y) => x - y); return s[s.length >> 1]; };
 
+  // ---------- Puntos densos con flujo óptico (para la malla) ----------
+  // ORB casi no encuentra pares en paredes y techos lisos (justo donde se notan los escalones de la orilla techo-pared).
+  // Con las rotaciones ya afinadas, se proyecta la foto j sobre la i (homografía de giro puro) y se siguen esquinas
+  // débiles (tirol, grietas, orillas) con Lucas-Kanade: el desplazamiento que queda es el paralaje/distorsión que la malla debe absorber.
+  function denseMatches(job, cv, imgs, feats, s, maxAng) {
+    const n = imgs.length, out = [], mats = [], cnt = { pairs: 0, det: 0, st: 0, fb: 0, big: 0, edge: 0, ok: 0 }; out.cnt = cnt;
+    const getMat = i => mats[i] || (mats[i] = cv.matFromArray(feats[i].gh, feats[i].gw, cv.CV_8UC1, grayFrom(imgs[i]).gray));
+    const proj = (P, w, f) => { const c = [dot(w, P.r), dot(w, P.u), dot(w, P.f)]; if (c[2] < 0.1) return null; const F = f.F * s; return [c[0] / c[2] * F + f.gw / 2, -c[1] / c[2] * F + f.gh / 2]; };
+    const perPair = job.densePerPair || 400;
+    const crit = new cv.TermCriteria(cv.TermCriteria_EPS | cv.TermCriteria_COUNT, 30, 0.01), win = new cv.Size(21, 21);
+    for (let i = 0; i < n; i++) for (let j = i + 1; j < n; j++) {
+      if (imgs[i].skip || imgs[j].skip || ang(imgs[i].f, imgs[j].f) > maxAng) continue;
+      const A = feats[i], B = feats[j], src = [], dst = [];
+      for (let gy = 0; gy <= 4; gy++) for (let gx = 0; gx <= 4; gx++) { // homografía i→j con una rejilla de rayos
+        const x = gx / 4 * A.gw, y = gy / 4 * A.gh, w = toWorld(imgs[i], camRay(x, y, A.gw, A.gh, A.F * s)), q = proj(imgs[j], w, B);
+        if (q) { src.push(x, y); dst.push(q[0], q[1]); }
+      }
+      if (src.length < 16) continue;
+      const sm = cv.matFromArray(src.length / 2, 1, cv.CV_32FC2, src), dm = cv.matFromArray(dst.length / 2, 1, cv.CV_32FC2, dst);
+      const H = cv.findHomography(sm, dm); sm.delete(); dm.delete();
+      if (!H || H.rows !== 3) { if (H) H.delete(); continue; }
+      const h = Array.from(H.data64F), mapH = (x, y) => { const z = h[6]*x + h[7]*y + h[8]; return [(h[0]*x + h[1]*y + h[2]) / z, (h[3]*x + h[4]*y + h[5]) / z]; };
+      const warped = new cv.Mat(), size = new cv.Size(A.gw, A.gh);
+      cv.warpPerspective(getMat(j), warped, H, size, cv.INTER_LINEAR | cv.WARP_INVERSE_MAP, cv.BORDER_CONSTANT, new cv.Scalar(0));
+      // zona común: donde la foto j cae dentro de su cuadro, con margen para la ventana de LK
+      const mask = new cv.Mat.zeros(A.gh, A.gw, cv.CV_8UC1), md = mask.data, mg = 16;
+      let area = 0;
+      for (let y = mg; y < A.gh - mg; y += 2) for (let x = mg; x < A.gw - mg; x += 2) {
+        const q = mapH(x, y); if (q[0] > mg && q[1] > mg && q[0] < B.gw - mg && q[1] < B.gh - mg) { md[y * A.gw + x] = md[y * A.gw + x + 1] = md[(y + 1) * A.gw + x] = md[(y + 1) * A.gw + x + 1] = 255; area++; }
+      }
+      H.delete();
+      if (area < 2000) { warped.delete(); mask.delete(); continue; }
+      // Se buscan esquinas por zonas: con un umbral global, las esquinas fuertes (escritorio, ventana) se llevan todo
+      // y el techo liso se queda sin puntos. Cada zona usa su propio umbral relativo.
+      const TX = 4, TY = 5, pts = [];
+      for (let ty = 0; ty < TY; ty++) for (let tx = 0; tx < TX; tx++) {
+        const r = new cv.Rect(Math.floor(tx * A.gw / TX), Math.floor(ty * A.gh / TY), Math.floor(A.gw / TX), Math.floor(A.gh / TY));
+        const sub = getMat(i).roi(r), msub = mask.roi(r), c = new cv.Mat();
+        if (cv.countNonZero(msub) > 400) {
+          cv.goodFeaturesToTrack(sub, c, Math.ceil(perPair * 3 / (TX * TY)) + 4, 0.01, 10, msub, 7);
+          for (let k = 0; k < c.rows; k++) pts.push(c.data32F[2*k] + r.x, c.data32F[2*k+1] + r.y);
+        }
+        sub.delete(); msub.delete(); c.delete();
+      }
+      mask.delete();
+      if (pts.length < 20) { warped.delete(); continue; }
+      const p0 = cv.matFromArray(pts.length / 2, 1, cv.CV_32FC2, pts); cnt.pairs++; cnt.det += pts.length / 2;
+      const p1 = new cv.Mat(), pb = new cv.Mat(), st = new cv.Mat(), st2 = new cv.Mat(), er = new cv.Mat(), er2 = new cv.Mat();
+      cv.calcOpticalFlowPyrLK(getMat(i), warped, p0, p1, st, er, win, 0, crit, 0, job.denseMinEig || 1e-4);
+      cv.calcOpticalFlowPyrLK(warped, getMat(i), p1, pb, st2, er2, win, 0, crit, 0, job.denseMinEig || 1e-4); // ida y vuelta: descarta seguimientos dudosos
+      const a0 = p0.data32F, a1 = p1.data32F, ab = pb.data32F, cand = [];
+      if (job.diag) { let f1 = 0, f2 = 0; for (let k = 0; k < p0.rows; k++) { if (!st.data[k]) f1++; else if (!st2.data[k]) f2++; } (cnt.per = cnt.per || []).push([i, j, p0.rows, f1, f2, Math.round(ang(imgs[i].f, imgs[j].f) * R2D)]); }
+      for (let k = 0; k < p0.rows; k++) {
+        if (!st.data[k] || !st2.data[k]) { cnt.st++; continue; }
+        const dx = a1[2*k] - a0[2*k], dy = a1[2*k+1] - a0[2*k+1], fb = Math.hypot(ab[2*k] - a0[2*k], ab[2*k+1] - a0[2*k+1]);
+        if (fb > (job.denseFB || 1)) { cnt.fb++; continue; } if (Math.hypot(dx, dy) > 12) { cnt.big++; continue; }
+        const q = mapH(a1[2*k], a1[2*k+1]);
+        if (q[0] < 1 || q[1] < 1 || q[0] > B.gw - 2 || q[1] > B.gh - 2) { cnt.edge++; continue; } cnt.ok++;
+        cand.push({ i, j, ax: a0[2*k], ay: a0[2*k+1], bx: q[0], by: q[1], d: er.data32F[k], dense: true });
+      }
+      cand.sort((p, q) => p.d - q.d); cand.slice(0, perPair).forEach(c => out.push(c));
+      [p0, p1, pb, st, st2, er, er2, warped].forEach(m => m.delete());
+    }
+    mats.forEach(m => m && m.delete());
+    return out;
+  }
+
   // ---------- 1) Feature-based refinement of rotations + shared focal scale ----------
   function refine(job, cv, progress) {
     const imgs = job.images, n = imgs.length, tanH = Math.tan(job.hfov * D2R / 2);
@@ -516,6 +583,27 @@
     // a esas fotos se les acepta más desacuerdo con el giroscopio al emparejar y se les da un prior débil en el giro vertical.
     const nearPole = imgs.map(im => Math.abs(im.f[2]) > 0.94); // |pitch| > ~70°
     const gyroTol = (i, j) => (nearPole[i] || nearPole[j] ? 30 : 8) * D2R;
+    const looseTol = (i, j) => (nearPole[i] || nearPole[j] ? 40 : 25) * D2R; // filtro grueso antes del RANSAC
+    // Giro Q que lleva los rayos de j a los de i a partir de 2 pares (tríada)
+    const triad = (a1, a2) => { const t1 = a1, t2 = nz(cross(a1, a2)), t3 = cross(t1, t2); return [t1, t2, t3]; };
+    function ransacRot(cand, maxRotAng) {
+      let best = [], seed = 12345; const rnd = () => (seed = (seed * 1103515245 + 12345) & 0x7fffffff) / 0x7fffffff;
+      const tolIn = (job.ransacTolDeg || 1.0) * D2R;
+      for (let it = 0; it < 300; it++) {
+        const p = cand[(rnd() * cand.length) | 0], q = cand[(rnd() * cand.length) | 0];
+        if (p === q || ang(p.wa, q.wa) < 3 * D2R) continue;
+        const Ta = triad(p.wa, q.wa), Tb = triad(p.wb, q.wb);
+        const rot = v => { const c = [dot(Tb[0], v), dot(Tb[1], v), dot(Tb[2], v)];
+          return [Ta[0][0]*c[0] + Ta[1][0]*c[1] + Ta[2][0]*c[2], Ta[0][1]*c[0] + Ta[1][1]*c[1] + Ta[2][1]*c[2], Ta[0][2]*c[0] + Ta[1][2]*c[1] + Ta[2][2]*c[2]]; };
+        // el giro relativo no puede ser enorme: el giroscopio sí sabe más o menos dónde está cada foto
+        const tr = Ta[0][0]*Tb[0][0] + Ta[1][0]*Tb[1][0] + Ta[2][0]*Tb[2][0] + Ta[0][1]*Tb[0][1] + Ta[1][1]*Tb[1][1] + Ta[2][1]*Tb[2][1] + Ta[0][2]*Tb[0][2] + Ta[1][2]*Tb[1][2] + Ta[2][2]*Tb[2][2];
+        if (Math.acos(clamp1((tr - 1) / 2)) > 2.5 * maxRotAng) continue;
+        const inl = cand.filter(c => ang(rot(c.wb), c.wa) < tolIn);
+        if (inl.length > best.length) best = inl;
+        if (best.length > 0.8 * cand.length && it > 30) break;
+      }
+      return best;
+    }
     const matches = []; let pairCount = 0, pi = 0; const totalPairs = n * (n - 1) / 2;
     for (let i = 0; i < n; i++) for (let j = i + 1; j < n; j++) {
       pi++;
@@ -530,11 +618,15 @@
         if (a.distance < 0.8 * b.distance) {
           const ax = A.pts[2*a.queryIdx], ay = A.pts[2*a.queryIdx+1], bx = B.pts[2*a.trainIdx], by = B.pts[2*a.trainIdx+1];
           const wa = toWorld(imgs[i], camRay(ax, ay, A.gw, A.gh, A.F)), wb = toWorld(imgs[j], camRay(bx, by, B.gw, B.gh, B.F));
-          if (ang(wa, wb) < gyroTol(i, j)) cand.push({ i, j, ax, ay, bx, by, d: a.distance });
+          if (ang(wa, wb) < looseTol(i, j)) cand.push({ i, j, ax, ay, bx, by, d: a.distance, wa, wb });
         }
         m.delete();
       }
       mm.delete();
+      // Antes se aceptaban solo pares a menos de 8° de lo que dice el giroscopio. Con el cel inclinado al techo la brújula
+      // se desvía más que eso: los pares buenos se tiraban, quedaban los malos y la foto salía girada (grieta duplicada 16°).
+      // Ahora se busca el giro relativo que pone de acuerdo a la mayoría de los pares (RANSAC) y se quedan esos.
+      if (cand.length >= 10) { const keep = ransacRot(cand, gyroTol(i, j)); cand.length = 0; keep.forEach(c => cand.push(c)); }
       if (cand.length >= 10) {
         cand.sort((p, q) => p.d - q.d);
         cand.slice(0, 250).forEach(c => matches.push(c)); pairCount++;
@@ -613,15 +705,25 @@
     const support = new Array(n).fill(0); for (const m of active) { support[m.i]++; support[m.j]++; }
     const dropped = [];
     for (let i = 1; i < n; i++) if (nearPole[i] && support[i] < (job.minPoleSupport ?? 15)) { imgs[i].skip = true; dropped.push(i); }
-    const out = { ok: true, matches: matches.length, used: active.length, pairs: pairCount, errBeforeDeg: before, errAfterDeg: errDeg(active), focalScale: s, k: K, support, dropped, level };
+    const out = { ok: true, corrDeg: acc.map(v => v.map(x => +(x * R2D).toFixed(2))), matches: matches.length, used: active.length, pairs: pairCount, errBeforeDeg: before, errAfterDeg: errDeg(active), focalScale: s, k: K, support, dropped, level };
     // Ajuste fino local (malla flexible por foto) para absorber el paralaje que un giro rígido no puede corregir
     const evalHeld = () => held.length ? median(held.map(m => norm(resid(m, s, K).e))) * R2D : null;
     if (held.length) out.heldBeforeDeg = evalHeld();
     if (job.mesh !== false) {
       progress('Ajuste fino', 0.97);
-      const mres = meshWarp(job, feats, imgs, active, s, K);
+      let meshMatches = active;
+      if (job.dense !== false && cv.calcOpticalFlowPyrLK) {
+        try {
+          const dn = denseMatches(job, cv, imgs, feats, s, 2 * vHalf * 0.95);
+          // se quedan solo los que el modelo rígido ya casi explica (lo demás son reflejos o cosas que se movieron)
+          const ok = dn.filter(m => norm(resid(m, s, K).e) < 1.5 * D2R);
+          meshMatches = active.concat(ok); out.dense = ok.length; out.denseCnt = Object.assign({ raw: dn.length }, dn.cnt);
+        } catch (e) { out.denseError = String(e && e.message || e); }
+      }
+      const mres = meshWarp(job, feats, imgs, meshMatches, s, K);
       out.mesh = mres;
       out.errMeshDeg = errDeg(active);
+      if (meshMatches !== active) out.errDenseDeg = errDeg(meshMatches.slice(active.length));
       if (held.length) out.heldAfterDeg = evalHeld();
     }
     if (job.diag) out.diag = { matches: active, F: feats.map(f => f.F * s), gw: feats.map(f => f.gw), gh: feats.map(f => f.gh) }; // solo para pruebas
@@ -1006,6 +1108,7 @@
     job.K = stats.refine && stats.refine.ok && stats.refine.k ? stats.refine.k : (job.K || null);
     progress('Igualando exposición', 0);
     const phot = photometric(job, F);
+    if (job.renderOnly) job.images.forEach((im, i) => { im.skip = !job.renderOnly.includes(i); }); // solo pruebas: pintar algunas fotos
     stats.gains = phot.gain.map(g => +g.toFixed(3)); stats.vignette = phot.vig.map(v => +v.toFixed(3)); stats.blend = job.blend || 'twoband';
     const rgba = render(job, F, phot, progress);
     if (job._seamStats) stats.seams = job._seamStats;
@@ -1115,7 +1218,10 @@ function planTripod(H, V, ov, includeNadir) {
   // Verificado con tests/test_cobertura.js: gran angular 4:3 = 18 tomas, 100% cubierto, sin hueco en el nadir.
   const p = Math.max(10, Math.min(90 - V / 2, V * (1 - ov)));
   const nFor = q => Math.max(4, Math.ceil(360 * Math.cos(q * D2R) / (H * (1 - ov))));
-  const rows = [{ pitch: 0, n: nFor(0) }, { pitch: p, n: nFor(p) }, { pitch: 90, n: 1 }, { pitch: -p, n: nFor(p) }];
+  // Filas inclinadas con tantas tomas como el horizonte (antes se reducían por cos(p): 5 a 72°). Con 5, las fotos del techo
+  // no compartían ni un punto entre sí (techo liso + vista muy distinta) y una podía quedar girada: grieta duplicada (Punto_02).
+  const nTilt = nFor(0);
+  const rows = [{ pitch: 0, n: nFor(0) }, { pitch: p, n: nTilt }, { pitch: 90, n: 1 }, { pitch: -p, n: nTilt }];
   if (includeNadir) rows.push({ pitch: -90, n: 1 });
   const targets = [];
   rows.forEach((row, ri) => {
@@ -1288,14 +1394,28 @@ async function listCameras() {
     if (d.deviceId === cur) o.selected = true;
     sel.appendChild(o);
   });
-  // Prefer ultra wide on first run if detectable
+  // Cámara guardada: por id y, si el id cambió (iOS los cambia entre sesiones o navegadores), por nombre.
+  // Si no se encuentra, se prefiere la ultra gran angular. Antes, un id viejo dejaba la 1x sin avisar.
+  let saved = null;
+  try { const raw = localStorage.getItem('guia360cam'); saved = raw && raw[0] === '{' ? JSON.parse(raw) : raw ? { id: raw } : null; } catch (x) {}
   const uw = devs.find(d => /ultra/i.test(d.label));
-  if (uw && uw.deviceId !== cur && !localStorage.getItem('guia360cam')) {
-    sel.value = uw.deviceId; await openCamera(uw.deviceId);
-  } else {
-    const saved = localStorage.getItem('guia360cam');
-    if (saved && devs.some(d => d.deviceId === saved) && saved !== cur) { sel.value = saved; await openCamera(saved); }
+  const pick = (saved && (devs.find(d => d.deviceId === saved.id) || (saved.label && devs.find(d => d.label === saved.label))))
+    || (cfg.lens !== 'main' ? uw : null);
+  if (pick && pick.deviceId !== cur) { sel.value = pick.deviceId; await openCamera(pick.deviceId); }
+  syncLensToCamera();
+}
+// En iPhone el nombre dice qué lente es. Si la cámara activa no es la gran angular, el campo de visión
+// configurado (100°) no corresponde y las fotos quedan sin traslape: se ajusta el lente solo y se avisa.
+function syncLensToCamera() {
+  const sel = $('inCam'), opts = [...sel.options];
+  if (!opts.some(o => /ultra/i.test(o.textContent)) || !sel.selectedOptions[0]) { S.lensWarn = ''; return; }
+  const isUW = /ultra/i.test(sel.selectedOptions[0].textContent);
+  if (cfg.lens === 'custom') { S.lensWarn = ''; return; }
+  const want = isUW ? 'uw' : 'main';
+  if (cfg.lens !== want) {
+    cfg.lens = want; cfg.longFov = LENS_FOV[want]; $('inLens').value = want; $('inFov').value = cfg.longFov; saveCfg(); rebuildPlan();
   }
+  S.lensWarn = isUW ? '' : 'Cámara 1x: hay menos campo y más tomas. Para mejores 360 elige la ultra gran angular en Ajustes.';
 }
 async function setCameraMode(mode) {
   // mode: 'manual' to lock, 'continuous' to release. Returns true if exposure locked.
@@ -1589,7 +1709,8 @@ function loop(ts) {
   if (S.calib) { drawCalib(pose); return; }
 
   if (!S.started) {
-    $('hint').textContent = S.orient ? 'Apunta al frente, a la altura del horizonte, y toca "Iniciar punto"' : 'Esperando giroscopio…';
+    $('hint').textContent = !S.orient ? 'Esperando giroscopio…'
+      : (S.lensWarn ? S.lensWarn + ' · ' : '') + 'Apunta al frente, a la altura del horizonte, y toca "Iniciar punto"';
     return;
   }
 
@@ -1852,6 +1973,8 @@ function finishStitch(m, secs, warn) {
   info += fall > 0 ? ` · viñeteo corregido (orillas −${fall}%)` : ' · sin corrección de viñeteo';
   if (cvSrc === 'cache') info += ' · motor guardado en el cel';
   if (warn) info += ' · ' + warn;
+  // Pocas coincidencias o error alto casi siempre es falta de traslape: lente distinto al configurado.
+  if (r.ok && (r.used < 400 || r.errAfterDeg > 1.5)) info += ' · ⚠ las fotos casi no se traslapan: revisa que la cámara sea la ultra gran angular (0.5x) y vuelve a tomar el punto';
   $('stitchInfo').textContent = info;
   $('stitchProg').style.display = 'none'; $('stitchResult').style.display = '';
   $('btnStitch').style.display = ''; $('btnStitch').textContent = 'Volver a crear con otras opciones';
@@ -2134,7 +2257,10 @@ $('inAutoLock').onchange = e => { cfg.autoLock = e.target.checked; saveCfg(); };
 $('inOutW').value = String(cfg.outW); $('inRefine').checked = cfg.refine;
 $('progress').onclick = () => { if (S.shots.length) showDone(); };
 $('inPoint').oninput = e => { $('pname').textContent = e.target.value; };
-$('inCam').onchange = async e => { try { localStorage.setItem('guia360cam', e.target.value); } catch (x) {} await openCamera(e.target.value); resetPoint(); };
+$('inCam').onchange = async e => {
+  try { localStorage.setItem('guia360cam', JSON.stringify({ id: e.target.value, label: e.target.selectedOptions[0] ? e.target.selectedOptions[0].textContent : '' })); } catch (x) {}
+  await openCamera(e.target.value); syncLensToCamera(); resetPoint();
+};
 $('inLens').onchange = e => { cfg.lens = e.target.value; if (LENS_FOV[cfg.lens]) { cfg.longFov = LENS_FOV[cfg.lens]; $('inFov').value = cfg.longFov; } saveCfg(); resetPoint(); };
 $('inFov').onchange = e => { cfg.longFov = Math.max(30, Math.min(130, +e.target.value || 100)); cfg.lens = 'custom'; $('inLens').value = 'custom'; saveCfg(); resetPoint(); };
 $('inOv').oninput = e => { cfg.ov = +e.target.value / 100; $('ovVal').textContent = e.target.value; saveCfg(); resetPoint(); };
