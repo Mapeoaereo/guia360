@@ -11,101 +11,224 @@
 <link rel="apple-touch-icon" href="icon-192.png">
 <title>Guía 360</title>
 <style>
-  :root { --ok:#2ee59d; --next:#ffb020; --bad:#ff5a5a; --bg:#000; --panel:rgba(18,18,22,.92); --txt:#f2f2f2; --mut:#9a9aa5; }
+  /* Guía 360 — instrumento de captura sobre tripié.
+     Visor negro, paneles de vidrio oscuro sobre la cámara, lecturas tabulares.
+     Color = significado: verde (hecho / a nivel), ámbar de estaca (siguiente toma), rojo (corrige). Nada decorativo. */
+  :root {
+    --visor:#000;                       /* fondo detrás de la cámara */
+    --tinta:#0c0d0f;                    /* pantallas sin cámara (inicio) */
+    --vidrio:rgba(14,15,17,.62);        /* paneles sobre la cámara */
+    --vidrio-alto:rgba(22,23,26,.94);   /* hojas (menús) */
+    --relieve:rgba(255,255,255,.06);    /* superficie elevada dentro de una hoja */
+    --campo:rgba(0,0,0,.35);            /* entradas: hundidas, más oscuras que la hoja */
+    --filo:rgba(255,255,255,.09);       /* bordes que casi no se ven */
+    --filo-fuerte:rgba(255,255,255,.16);
+    --tiza:#f3f2ee;                     /* texto principal */
+    --tiza-2:rgba(243,242,238,.72);     /* texto de apoyo */
+    --tiza-3:rgba(243,242,238,.5);      /* metadatos */
+    --nivel:#2ee59d;                    /* hecho / a nivel (verde de burbuja) */
+    --nivel-tinta:#00261a;
+    --estaca:#ffad1f;                   /* siguiente toma (cinta de topógrafo) */
+    --corrige:#ff5f57;                  /* fuera de nivel / error */
+    --r-s:10px; --r-m:14px; --r-l:22px; /* radios: controles · tarjetas · hojas */
+    --curva:cubic-bezier(.23,1,.32,1);
+    /* nombres que usa el código */
+    --ok:var(--nivel); --next:var(--estaca); --bad:var(--corrige); --txt:var(--tiza); --mut:var(--tiza-3);
+  }
   * { box-sizing:border-box; -webkit-tap-highlight-color:transparent; }
-  html,body { margin:0; height:100%; background:var(--bg); color:var(--txt); font-family:-apple-system,system-ui,Roboto,sans-serif; overflow:hidden; touch-action:manipulation; }
+  html,body { margin:0; height:100%; background:var(--visor); color:var(--tiza); font-family:-apple-system,"SF Pro Text",system-ui,Roboto,sans-serif;
+    font-size:15px; line-height:1.4; overflow:hidden; touch-action:manipulation; -webkit-font-smoothing:antialiased; }
+  .num { font-variant-numeric:tabular-nums; }
+
+  /* ---------- Botones ---------- */
+  button { font:inherit; font-weight:600; border:0; border-radius:var(--r-m); padding:13px 16px; min-height:48px; background:var(--relieve);
+    color:var(--tiza); box-shadow:inset 0 0 0 1px var(--filo); transition:transform .12s var(--curva), background-color .15s, opacity .15s; }
+  button:active { transform:scale(.97); }
+  button:disabled { opacity:.4; }
+  button:focus-visible, input:focus-visible, select:focus-visible { outline:2px solid var(--nivel); outline-offset:2px; }
+  button.primary { background:var(--nivel); color:var(--nivel-tinta); box-shadow:none; }
+  button.ghost { background:transparent; }
+  .ico { width:20px; height:20px; flex:none; stroke:currentColor; fill:none; stroke-width:1.8; stroke-linecap:round; stroke-linejoin:round; }
+
+  /* ---------- Cámara y capas ---------- */
   #video { position:fixed; inset:0; width:100%; height:100%; object-fit:cover; background:#000; }
   #overlay { position:fixed; inset:0; width:100%; height:100%; pointer-events:none; }
-  .screen { position:fixed; inset:0; display:flex; flex-direction:column; align-items:center; justify-content:center; padding:24px; text-align:center; background:#0b0b0e; z-index:50; }
-  .screen h1 { font-size:28px; margin:0 0 8px; }
-  .screen p { color:var(--mut); max-width:420px; line-height:1.45; }
-  button { font:inherit; border:0; border-radius:14px; padding:14px 18px; background:#2a2a33; color:var(--txt); font-weight:600; }
-  button.primary { background:var(--ok); color:#002b18; }
-  button:disabled { opacity:.4; }
-  #topbar { position:fixed; top:0; left:0; right:0; padding:calc(env(safe-area-inset-top) + 8px) 12px 8px; display:flex; gap:8px; align-items:center; flex-wrap:wrap; z-index:10; background:linear-gradient(#000a,#0000); }
-  .chip { font-size:12px; padding:5px 9px; border-radius:999px; background:#000a; border:1px solid #ffffff22; white-space:nowrap; }
-  .chip.ok { border-color:var(--ok); color:var(--ok); }
-  .chip.bad { border-color:var(--bad); color:var(--bad); }
-  #pname { font-weight:700; font-size:15px; }
-  #progress { margin-left:auto; font-weight:700; font-size:15px; }
-  #hint { position:fixed; left:0; right:0; bottom:calc(env(safe-area-inset-bottom) + 186px); text-align:center; font-size:17px; font-weight:700; text-shadow:0 1px 4px #000; z-index:10; padding:0 16px; }
-  #bottom { position:fixed; left:0; right:0; bottom:0; padding:8px 12px calc(env(safe-area-inset-bottom) + 12px); z-index:10; background:linear-gradient(#0000,#000c 30%); }
-  #mapwrap { display:flex; justify-content:center; margin-bottom:10px; }
-  #minimap { width:240px; height:120px; border-radius:8px; border:1px solid #ffffff33; image-rendering:pixelated; background:#111; }
-  #controls { display:flex; gap:10px; align-items:center; justify-content:space-between; }
-  #shoot { width:72px; height:72px; border-radius:50%; background:#fff; border:5px solid #ffffff55; background-clip:padding-box; padding:0; }
-  #shoot.start { width:auto; height:56px; border-radius:16px; padding:0 22px; background:var(--ok); color:#002b18; border:0; }
-  .side { min-width:92px; font-size:14px; padding:12px 10px; }
   #flash { position:fixed; inset:0; background:#fff; opacity:0; pointer-events:none; transition:opacity .25s; z-index:20; }
-  .sheet { position:fixed; left:0; right:0; bottom:0; max-height:86%; max-height:86dvh; overflow:auto; overscroll-behavior:contain; -webkit-overflow-scrolling:touch; background:var(--panel); backdrop-filter:blur(10px); border-radius:20px 20px 0 0; padding:0 16px calc(env(safe-area-inset-bottom) + 18px); z-index:40; display:none; }
-  .sheet.open { display:block; }
+
+  /* ---------- Pantalla de inicio ---------- */
+  .screen { position:fixed; inset:0; display:flex; flex-direction:column; justify-content:flex-end; gap:12px; padding:calc(env(safe-area-inset-top) + 24px) 20px calc(env(safe-area-inset-bottom) + 24px);
+    background:radial-gradient(120% 60% at 50% 0%, #15171b 0%, var(--tinta) 60%); z-index:50; overflow:auto; }
+  .marca { display:flex; flex-direction:column; align-items:flex-start; gap:10px; margin:auto 0 8px; max-width:440px; }
+  .marca svg { width:56px; height:56px; }
+  .marca h1 { font-size:32px; line-height:1.1; letter-spacing:-.02em; margin:6px 0 0; font-weight:700; }
+  .marca p { color:var(--tiza-2); margin:0; text-wrap:pretty; }
+  .marca .pasos { display:flex; gap:6px; flex-wrap:wrap; margin-top:4px; }
+  .marca .pasos span { font-size:12px; color:var(--tiza-2); padding:5px 10px; border-radius:999px; box-shadow:inset 0 0 0 1px var(--filo); }
+  .acciones { display:flex; flex-direction:column; gap:10px; max-width:440px; width:100%; }
+  .acciones button { width:100%; min-height:54px; display:flex; align-items:center; justify-content:center; gap:10px; }
+  #err { color:var(--corrige); font-size:14px; margin:0; min-height:0; }
+  #err:empty { display:none; }
+  .estado { display:flex; gap:10px; align-items:flex-start; font-size:12.5px; color:var(--tiza-2); max-width:440px; margin:6px 0 0; }
+  .estado::before { content:''; flex:none; width:8px; height:8px; border-radius:50%; margin-top:5px; background:var(--estaca); }
+  .estado.listo::before { background:var(--nivel); }
+  .tarjeta-aviso { background:rgba(255,173,31,.08); box-shadow:inset 0 0 0 1px rgba(255,173,31,.35); border-radius:var(--r-m); padding:14px; max-width:440px; }
+  .tarjeta-aviso p { margin:0 0 12px; color:var(--tiza); }
+  .tarjeta-aviso .etq { display:block; font-size:11px; font-weight:600; letter-spacing:.08em; text-transform:uppercase; color:var(--estaca); margin-bottom:4px; }
+
+  /* ---------- Tira de instrumento (arriba) ---------- */
+  #topbar { position:fixed; top:0; left:0; right:0; z-index:10; padding:calc(env(safe-area-inset-top) + 8px) 10px 18px;
+    display:flex; align-items:center; gap:8px; background:linear-gradient(rgba(0,0,0,.55), rgba(0,0,0,0)); }
+  #pname { font-weight:650; font-size:15px; min-width:0; flex:1 1 auto; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; text-shadow:0 1px 3px rgba(0,0,0,.5); }
+  .lecturas { display:flex; align-items:stretch; flex:none; background:var(--vidrio); -webkit-backdrop-filter:blur(14px); backdrop-filter:blur(14px);
+    border-radius:var(--r-m); box-shadow:inset 0 0 0 1px var(--filo); }
+  .lect { display:flex; flex-direction:column; justify-content:center; padding:5px 11px; min-width:0; }
+  .lect + .lect { box-shadow:-1px 0 0 var(--filo); }
+  .lect small { font-size:9.5px; font-weight:600; letter-spacing:.08em; text-transform:uppercase; color:var(--tiza-3); line-height:1.2; }
+  .chip { font-size:13px; font-weight:600; font-variant-numeric:tabular-nums; white-space:nowrap; line-height:1.3; display:flex; align-items:center; gap:5px; }
+  .chip::before { content:''; width:6px; height:6px; border-radius:50%; background:var(--tiza-3); flex:none; }
+  .chip.ok { color:var(--nivel); } .chip.ok::before { background:var(--nivel); }
+  .chip.bad { color:var(--corrige); } .chip.bad::before { background:var(--corrige); }
+  #chipAE { pointer-events:auto; cursor:pointer; }
+  #progress { font-size:17px; font-weight:700; font-variant-numeric:tabular-nums; line-height:1.15; }
+  #progress::before { display:none; }
+  #chipRes { display:none; } /* la resolución vive en Controles de cámara; solo aparece arriba si es baja */
+  #chipRes.bad { display:flex; position:fixed; top:calc(env(safe-area-inset-top) + 62px); right:10px; z-index:10; padding:5px 10px; border-radius:999px; background:var(--vidrio); }
+
+  /* ---------- Parte de abajo: instrucción, cobertura, controles ---------- */
+  #bottom { position:fixed; left:0; right:0; bottom:0; z-index:10; display:flex; flex-direction:column; align-items:center; gap:10px;
+    padding:28px 12px calc(env(safe-area-inset-bottom) + 14px); background:linear-gradient(rgba(0,0,0,0), rgba(0,0,0,.6) 38%); }
+  #hint { position:static; max-width:100%; font-size:16px; font-weight:650; text-align:center; padding:9px 16px; border-radius:999px;
+    background:var(--vidrio); -webkit-backdrop-filter:blur(14px); backdrop-filter:blur(14px); box-shadow:inset 0 0 0 1px var(--filo); text-wrap:balance; }
+  #hint:empty { display:none; }
+  #mapwrap { position:relative; }
+  #minimap { display:block; width:232px; height:116px; border-radius:var(--r-s); image-rendering:pixelated; background:#141518; box-shadow:0 0 0 1px var(--filo); }
+  #mapwrap::after { content:'Cobertura'; position:absolute; left:8px; top:6px; font-size:9.5px; font-weight:600; letter-spacing:.08em; text-transform:uppercase; color:var(--tiza-3); pointer-events:none; }
+  #controls { display:grid; grid-template-columns:1fr auto 1fr; align-items:center; gap:12px; width:100%; max-width:420px; }
+  .side { justify-self:start; display:flex; flex-direction:column; align-items:center; gap:3px; min-width:76px; padding:8px 10px; font-size:12px; font-weight:600;
+    background:var(--vidrio); -webkit-backdrop-filter:blur(14px); backdrop-filter:blur(14px); }
+  #btnUndo { justify-self:end; }
+  /* Disparador: anillo de cámara. En reposo (antes de iniciar el punto) es una píldora verde con texto */
+  #shoot { width:76px; height:76px; min-height:0; border-radius:50%; padding:0; background:var(--tiza); box-shadow:0 0 0 4px rgba(0,0,0,.35), 0 0 0 7px rgba(243,242,238,.9); }
+  #shoot:active { transform:scale(.94); }
+  #shoot.start { width:auto; height:56px; border-radius:999px; padding:0 26px; background:var(--nivel); color:var(--nivel-tinta); font-size:16px; box-shadow:none; }
+
+  /* ---------- Hojas (menús) ---------- */
+  .sheet { position:fixed; left:0; right:0; bottom:0; max-height:88%; max-height:88dvh; overflow:auto; overscroll-behavior:contain; -webkit-overflow-scrolling:touch;
+    background:var(--vidrio-alto); -webkit-backdrop-filter:blur(20px); backdrop-filter:blur(20px); border-radius:var(--r-l) var(--r-l) 0 0;
+    box-shadow:0 -1px 0 var(--filo-fuerte); padding:0 16px calc(env(safe-area-inset-bottom) + 18px); z-index:40; display:none; }
+  .sheet.open { display:block; animation:sube .26s var(--curva); }
+  @keyframes sube { from { transform:translateY(24px); opacity:0; } to { transform:none; opacity:1; } }
   /* Encabezado fijo con ✕: siempre visible aunque el menú sea más largo que la pantalla */
-  .sheethead { position:sticky; top:0; z-index:2; display:flex; align-items:center; justify-content:space-between; gap:10px; margin:0 -16px 12px; padding:14px 12px 10px 16px; background:#121216; border-radius:20px 20px 0 0; border-bottom:1px solid #ffffff14; }
-  .sheethead h2 { margin:0; font-size:19px; }
-  .xbtn { flex:none; width:44px; height:44px; padding:0; border-radius:50%; font-size:20px; line-height:44px; background:#2a2a33; }
-  #backdrop { position:fixed; inset:0; z-index:39; background:#0006; display:none; }
+  .sheethead { position:sticky; top:0; z-index:2; display:flex; align-items:center; justify-content:space-between; gap:10px; margin:0 -16px 6px;
+    padding:10px 10px 10px 18px; background:rgba(22,23,26,.97); border-radius:var(--r-l) var(--r-l) 0 0; box-shadow:0 1px 0 var(--filo); }
+  .sheethead::before { content:''; position:absolute; top:6px; left:50%; width:36px; height:4px; margin-left:-18px; border-radius:2px; background:var(--filo-fuerte); }
+  .sheethead h2 { margin:8px 0 0; font-size:19px; letter-spacing:-.01em; }
+  .xbtn { flex:none; width:44px; height:44px; min-height:0; padding:0; margin-top:6px; border-radius:50%; font-size:17px; line-height:44px; }
+  #backdrop { position:fixed; inset:0; z-index:39; background:rgba(0,0,0,.45); display:none; }
   #backdrop.open { display:block; }
-  .row { display:flex; flex-direction:column; gap:6px; margin-bottom:14px; text-align:left; }
-  .row label { font-size:13px; color:var(--mut); }
-  .row input[type=text], .row input[type=number], .row select { font:inherit; padding:11px; border-radius:10px; border:1px solid #ffffff22; background:#1c1c22; color:var(--txt); }
-  .row.inline { flex-direction:row; align-items:center; justify-content:space-between; }
+  .grupo { margin:18px 0 0; }
+  .grupo > h3 { font-size:11px; font-weight:600; letter-spacing:.08em; text-transform:uppercase; color:var(--tiza-3); margin:0 0 8px 2px; }
+  .panel { background:var(--relieve); border-radius:var(--r-m); padding:14px; box-shadow:inset 0 0 0 1px var(--filo); }
+  .panel > .row:last-child, .panel > .ctl:last-child { margin-bottom:0; }
+  .row { display:flex; flex-direction:column; gap:7px; margin-bottom:14px; text-align:left; }
+  .row label, .ctl label { font-size:13px; font-weight:500; color:var(--tiza-2); }
+  .row label b, .ctl label b { color:var(--tiza); font-variant-numeric:tabular-nums; }
+  .row input[type=text], .row input[type=number], .row select, .ctl select { font:inherit; width:100%; min-height:46px; padding:11px 12px; border-radius:var(--r-s);
+    border:0; box-shadow:inset 0 0 0 1px var(--filo); background:var(--campo); color:var(--tiza); -webkit-appearance:none; appearance:none; }
+  .row select, .ctl select { padding-right:36px; background-image:url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='12' height='8' fill='none' stroke='%23f3f2ee' stroke-opacity='.6' stroke-width='1.8' stroke-linecap='round'%3E%3Cpath d='M1 1.5l5 5 5-5'/%3E%3C/svg%3E");
+    background-repeat:no-repeat; background-position:right 14px center; }
+  .row.inline { flex-direction:row; align-items:center; justify-content:space-between; gap:14px; }
+  .row.inline label { color:var(--tiza); font-weight:500; }
+  input[type=range] { width:100%; accent-color:var(--nivel); height:28px; }
+  /* Interruptores (checkbox con forma de switch) */
+  input[type=checkbox] { -webkit-appearance:none; appearance:none; flex:none; width:46px; height:28px; border-radius:999px; background:rgba(255,255,255,.16); position:relative;
+    transition:background-color .18s var(--curva); margin:0; }
+  input[type=checkbox]::after { content:''; position:absolute; top:3px; left:3px; width:22px; height:22px; border-radius:50%; background:#fff; transition:transform .18s var(--curva); }
+  input[type=checkbox]:checked { background:var(--nivel); }
+  input[type=checkbox]:checked::after { transform:translateX(18px); }
   .btns { display:flex; gap:10px; flex-wrap:wrap; }
   .btns button { flex:1; }
-  .note { font-size:12px; color:var(--mut); line-height:1.4; }
-  #plansum { font-size:13px; color:var(--txt); background:#ffffff0d; border-radius:10px; padding:10px; line-height:1.45; }
-  #calib { position:fixed; left:12px; right:12px; top:calc(env(safe-area-inset-top) + 64px); background:var(--panel); border-radius:14px; padding:14px; z-index:30; display:none; text-align:center; }
+  .note { font-size:12.5px; color:var(--tiza-3); line-height:1.45; text-wrap:pretty; }
+  #plansum { font-size:13px; color:var(--tiza-2); line-height:1.5; }
+  #plansum b { color:var(--tiza); font-size:15px; }
+  #calib { position:fixed; left:12px; right:12px; top:calc(env(safe-area-inset-top) + 64px); background:var(--vidrio-alto); -webkit-backdrop-filter:blur(20px); backdrop-filter:blur(20px);
+    border-radius:var(--r-m); box-shadow:inset 0 0 0 1px var(--filo); padding:14px; z-index:30; display:none; text-align:center; }
   #calib.open { display:block; }
-  #warn { position:fixed; inset:0; background:#000d; z-index:60; display:none; align-items:center; justify-content:center; padding:30px; text-align:center; font-size:18px; font-weight:700; }
+  #warn { position:fixed; inset:0; background:rgba(0,0,0,.88); z-index:60; display:none; align-items:center; justify-content:center; padding:30px; text-align:center; font-size:18px; font-weight:700; }
   #warn.open { display:flex; }
-  #err { color:var(--bad); font-size:14px; max-width:420px; }
-  #chipAE { pointer-events:auto; }
   .ctl { margin-bottom:14px; text-align:left; }
-  .ctl label { display:flex; justify-content:space-between; font-size:13px; color:var(--mut); margin-bottom:6px; }
-  .ctl label b { color:var(--txt); }
-  .ctl input[type=range] { width:100%; }
-  .ctl select { width:100%; font:inherit; padding:10px; border-radius:10px; border:1px solid #ffffff22; background:#1c1c22; color:var(--txt); }
-  .bar { height:10px; border-radius:6px; background:#ffffff1a; overflow:hidden; margin:8px 0 4px; }
-  .bar > div { height:100%; width:0; background:var(--ok); transition:width .2s; }
-  #viewer { width:100%; aspect-ratio:3/4; max-height:52vh; border-radius:12px; background:#111; touch-action:none; display:block; margin:10px 0; }
-  #stitchBox { border-top:1px solid #ffffff1a; margin-top:14px; padding-top:14px; }
+  .ctl label { display:flex; justify-content:space-between; margin-bottom:7px; }
+  .bar { height:6px; border-radius:3px; background:rgba(255,255,255,.1); overflow:hidden; margin:10px 0 4px; }
+  .bar > div { height:100%; width:0; background:var(--nivel); transition:width .2s linear; }
+  #stitchStage { color:var(--tiza-2); font-size:13.5px; }
+
+  /* ---------- Punto terminado ---------- */
+  #doneInfo { margin:0 0 4px; }
+  #stitchBox { margin-top:12px; }
+  #viewer { width:100%; aspect-ratio:3/4; max-height:56vh; border-radius:var(--r-m); background:#111; touch-action:none; display:block; margin:0 0 10px;
+    box-shadow:0 0 0 1px var(--filo); }
+  #stitchInfo { margin:0 0 12px; }
+  .acciones-punto { display:grid; grid-template-columns:1fr 1fr; gap:10px; }
+  .acciones-punto .ancho { grid-column:1 / -1; }
+
+  @media (prefers-reduced-motion: reduce) { .sheet.open { animation:none; } button { transition:none; } }
 </style>
 </head>
 <body>
+<svg width="0" height="0" style="position:absolute" aria-hidden="true">
+  <symbol id="i-ajustes" viewBox="0 0 24 24"><path d="M4 7h10M18 7h2M4 17h4M12 17h8"/><circle cx="16" cy="7" r="2"/><circle cx="10" cy="17" r="2"/></symbol>
+  <symbol id="i-deshacer" viewBox="0 0 24 24"><path d="M9 14L4 9l5-5"/><path d="M4 9h10a6 6 0 010 12h-3"/></symbol>
+  <symbol id="i-camara" viewBox="0 0 24 24"><path d="M4 8h3l2-3h6l2 3h3v11H4z"/><circle cx="12" cy="13" r="3.5"/></symbol>
+  <symbol id="i-zip" viewBox="0 0 24 24"><path d="M6 3h8l4 4v14H6z"/><path d="M14 3v4h4M10 6h1M10 9h1M10 12h1M9 15h3v3H9z"/></symbol>
+  <symbol id="i-bajar" viewBox="0 0 24 24"><path d="M12 4v11M7 10l5 5 5-5M5 20h14"/></symbol>
+  <symbol id="i-compartir" viewBox="0 0 24 24"><path d="M12 15V4M8 8l4-4 4 4M6 12v8h12v-8"/></symbol>
+</svg>
 <video id="video" playsinline muted autoplay></video>
 <canvas id="overlay"></canvas>
 <div id="flash"></div>
 
 <div id="start" class="screen">
-  <h1>Guía 360</h1>
-  <p>Te marca en pantalla a dónde apuntar el cel para cubrir toda la habitación, dispara sola cuando estás alineado y te muestra en el minimapa qué zonas faltan.</p>
-  <p>Úsala con el cel en <b>vertical</b> y montado en el tripié.</p>
-  <div id="recoverBox" style="display:none; background:#ffb02022; border:1px solid var(--next); border-radius:14px; padding:12px; margin:0 0 14px; max-width:420px">
-    <p id="recoverText" style="color:var(--txt); margin:0 0 10px"></p>
-    <div class="btns"><button id="btnRecoverDrop">Descartar</button><button id="btnRecover" class="primary">Recuperar</button></div>
+  <div class="marca">
+    <svg viewBox="0 0 56 56" fill="none" stroke="var(--nivel)" stroke-width="2" aria-hidden="true">
+      <circle cx="28" cy="28" r="24"/><ellipse cx="28" cy="28" rx="10" ry="24"/><path d="M4 28h48"/>
+      <path d="M8 16h40M8 40h40" stroke-opacity=".45"/><circle cx="28" cy="28" r="3" fill="var(--estaca)" stroke="none"/>
+    </svg>
+    <h1>Guía 360</h1>
+    <p>Te marca a dónde apuntar el cel, dispara sola cuando estás alineado y une la esfera aquí mismo.</p>
+    <div class="pasos"><span>Cel en vertical</span><span>Sobre el tripié</span><span>Sigue la marca ámbar</span></div>
   </div>
-  <button id="btnEnable" class="primary">Activar cámara y sensores</button>
-  <p id="err"></p>
-  <button id="btnLoadZip" style="margin-top:6px; background:transparent; border:1px solid #ffffff33">Crear 360 desde un ZIP</button>
-  <input id="inZip" type="file" accept=".zip,application/zip" style="display:none">
-  <p class="note" id="offlineStart" style="margin-top:14px"></p>
+  <div id="recoverBox" class="tarjeta-aviso" style="display:none">
+    <span class="etq">Punto sin terminar</span>
+    <p id="recoverText"></p>
+    <div class="btns"><button id="btnRecoverDrop" class="ghost">Descartar</button><button id="btnRecover" class="primary">Recuperar</button></div>
+  </div>
+  <div class="acciones">
+    <button id="btnEnable" class="primary"><svg class="ico"><use href="#i-camara"/></svg>Activar cámara y sensores</button>
+    <p id="err"></p>
+    <button id="btnLoadZip" class="ghost"><svg class="ico"><use href="#i-zip"/></svg>Crear 360 desde un ZIP</button>
+    <input id="inZip" type="file" accept=".zip,application/zip" style="display:none">
+  </div>
+  <p class="estado" id="offlineStart"></p>
+  <button id="btnOfflineStart" class="ghost" style="display:none; max-width:440px; min-height:44px; font-size:14px">Preparar para usar sin internet</button>
 </div>
 
 <div id="topbar">
   <span id="pname">Punto 01</span>
-  <span id="chipLevel" class="chip">Nivel —</span>
-  <span id="chipAE" class="chip">Exposición —</span>
+  <div class="lecturas">
+    <div class="lect"><small>Nivel</small><span id="chipLevel" class="chip">—</span></div>
+    <div class="lect" id="lectAE"><small>Exposición</small><span id="chipAE" class="chip">—</span></div>
+    <div class="lect"><small>Tomas</small><span id="progress" class="chip">0/0</span></div>
+  </div>
   <span id="chipRes" class="chip">—</span>
-  <span id="progress">0/0</span>
 </div>
 
-<div id="hint"></div>
-
 <div id="bottom">
-  <div id="mapwrap"><canvas id="minimap" width="240" height="120"></canvas></div>
+  <div id="hint" role="status" aria-live="polite"></div>
+  <div id="mapwrap"><canvas id="minimap" width="240" height="120" aria-label="Cobertura de la esfera"></canvas></div>
   <div id="controls">
-    <button id="btnSettings" class="side">⚙ Ajustes</button>
-    <button id="shoot" class="start">Iniciar punto</button>
-    <button id="btnUndo" class="side">↶ Deshacer</button>
+    <button id="btnSettings" class="side"><svg class="ico"><use href="#i-ajustes"/></svg>Ajustes</button>
+    <button id="shoot" class="start" aria-label="Disparar">Iniciar punto</button>
+    <button id="btnUndo" class="side"><svg class="ico"><use href="#i-deshacer"/></svg>Deshacer</button>
   </div>
 </div>
 
@@ -121,49 +244,58 @@
 
 <div id="settings" class="sheet">
   <div class="sheethead"><h2>Ajustes</h2><button class="xbtn" data-close="settings" aria-label="Cerrar">✕</button></div>
-  <div class="row"><label>Nombre del punto</label><input id="inPoint" type="text" value="Punto 01"></div>
-  <div class="row"><label>Cámara</label><select id="inCam"></select>
-    <span class="note">Elige el gran angular (0.5x). En iPhone aparece como "Back Ultra Wide Camera"; en Samsung prueba cada "facing back" y quédate con la que se vea más abierta.</span></div>
-  <div class="row"><label>Lente</label>
-    <select id="inLens">
-      <option value="uw">Ultra gran angular 0.5x (recomendado)</option>
-      <option value="main">Principal 1x</option>
-      <option value="custom">Personalizado / calibrado</option>
-    </select></div>
-  <div class="row"><label>Campo de visión del lado largo (grados)</label><input id="inFov" type="number" min="30" max="130" step="1" value="100">
-    <span class="note">Si los círculos no "se quedan pegados" a la pared al girar, calibra.</span>
-    <button id="btnCalib">Calibrar campo de visión</button></div>
-  <div class="row"><label>Traslape entre fotos: <b id="ovVal">30</b>%</label><input id="inOv" type="range" min="20" max="45" value="30"></div>
-  <div class="row"><label>Tolerancia de alineación: <b id="tolVal">3</b>°</label><input id="inTol" type="range" min="1" max="6" value="3"></div>
-  <div class="row"><button id="btnCamPanel">📷 Controles de cámara (exposición, ISO, balance, enfoque)</button></div>
-  <div class="row inline"><label>Disparo automático al alinear</label><input id="inAuto" type="checkbox" checked></div>
-  <div class="row"><label>Patrón de tomas</label>
-    <select id="inPattern">
-      <option value="tripod">Tripié: filas a ±40° + techo</option>
-      <option value="compact">Compacto: filas a ±70°</option>
-    </select>
-    <span class="note">El tripié inclina menos el cel: el piso y el techo salen más centrados y con menos paralaje, a cambio de ~3 tomas más.</span></div>
-  <div class="row inline"><label>Incluir foto del piso (nadir)</label><input id="inNadir" type="checkbox"></div>
-  <div class="row"><div id="plansum"></div></div>
-  <div class="row"><label>Uso sin internet</label>
-    <div id="offlineStatus" class="note" style="color:var(--txt)">Revisando…</div>
-    <button id="btnOffline">Preparar para usar sin internet</button>
-    <span class="note">Hazlo con señal antes de salir: guarda la app y el motor de alineación (~10 MB) en el cel. En iPhone, abre la app desde Safari y usa Compartir → Agregar a inicio; así iOS no borra lo guardado.</span></div>
-  <span class="note">Cambiar lente, campo de visión, traslape, patrón o nadir reinicia el punto actual.</span>
-  <div class="btns" style="margin-top:14px"><button id="btnCloseSettings" class="primary">Listo</button></div>
+  <section class="grupo"><h3>Punto</h3><div class="panel">
+    <div class="row"><label for="inPoint">Nombre del punto</label><input id="inPoint" type="text" value="Punto 01"></div>
+    <div class="row"><div id="plansum"></div></div>
+  </div></section>
+  <section class="grupo"><h3>Lente y cámara</h3><div class="panel">
+    <div class="row"><label for="inCam">Cámara</label><select id="inCam"></select>
+      <span class="note">Elige el gran angular (0.5x). En iPhone aparece como "Back Ultra Wide Camera"; en Samsung prueba cada "facing back" y quédate con la que se vea más abierta.</span></div>
+    <div class="row"><label for="inLens">Lente</label>
+      <select id="inLens">
+        <option value="uw">Ultra gran angular 0.5x (recomendado)</option>
+        <option value="main">Principal 1x</option>
+        <option value="custom">Personalizado / calibrado</option>
+      </select></div>
+    <div class="row"><label for="inFov">Campo de visión del lado largo (grados)</label><input id="inFov" type="number" inputmode="numeric" min="30" max="130" step="1" value="100">
+      <span class="note">Si los círculos no "se quedan pegados" a la pared al girar, calibra.</span>
+      <button id="btnCalib">Calibrar campo de visión</button></div>
+    <div class="row"><button id="btnCamPanel"><svg class="ico" style="vertical-align:-4px;margin-right:8px"><use href="#i-camara"/></svg>Controles de cámara</button>
+      <span class="note">Exposición, ISO, balance de blancos, enfoque y resolución.</span></div>
+  </div></section>
+  <section class="grupo"><h3>Captura</h3><div class="panel">
+    <div class="row"><label for="inPattern">Patrón de tomas</label>
+      <select id="inPattern">
+        <option value="tripod">Tripié: filas a ±40° + techo</option>
+        <option value="compact">Compacto: filas a ±70°</option>
+      </select>
+      <span class="note">El tripié inclina menos el cel: el piso y el techo salen más centrados y con menos paralaje, a cambio de ~3 tomas más.</span></div>
+    <div class="row"><label for="inOv">Traslape entre fotos <b id="ovVal">30</b><b>%</b></label><input id="inOv" type="range" min="20" max="45" value="30"></div>
+    <div class="row"><label for="inTol">Tolerancia de alineación <b id="tolVal">3</b><b>°</b></label><input id="inTol" type="range" min="1" max="6" value="3"></div>
+    <div class="row inline"><label for="inAuto">Disparo automático al alinear</label><input id="inAuto" type="checkbox" checked></div>
+    <div class="row inline"><label for="inNadir">Incluir foto del piso (nadir)</label><input id="inNadir" type="checkbox"></div>
+    <span class="note">Cambiar lente, campo de visión, traslape, patrón o nadir reinicia el punto actual.</span>
+  </div></section>
+  <section class="grupo"><h3>Sin internet</h3><div class="panel">
+    <div id="offlineStatus" class="estado" style="margin:0 0 12px">Revisando…</div>
+    <button id="btnOffline" style="width:100%">Preparar para usar sin internet</button>
+    <p class="note" style="margin:10px 0 0">Hazlo con señal antes de salir: guarda la app y el motor de alineación (~10 MB). En iPhone, ábrela desde Safari y usa Compartir → Agregar a inicio para que iOS no borre lo guardado.</p>
+  </div></section>
+  <div class="btns" style="margin-top:18px"><button id="btnCloseSettings" class="primary">Listo</button></div>
 </div>
 
 <div id="camsheet" class="sheet">
   <div class="sheethead"><h2>Controles de cámara</h2><button class="xbtn" data-close="camsheet" aria-label="Cerrar">✕</button></div>
-  <div id="camControls"></div>
-  <div class="ctl"><label>Resolución de captura</label>
+  <div class="panel" style="margin-top:12px"><div id="camControls"></div>
+  <div class="ctl"><label>Resolución de captura <b id="resNow"></b></label>
     <select id="inRes">
       <option value="max">Máxima disponible</option>
       <option value="4k">4K (3840×2160)</option>
       <option value="1080">1080p (más rápido, menos detalle)</option>
     </select></div>
-  <div class="row inline"><label>Bloquear exposición y balance al iniciar cada punto</label><input id="inAutoLock" type="checkbox" checked></div>
-  <p class="note">Si ajustas algo a mano, la app ya no toca la exposición al iniciar el punto: se queda con tus valores. "Restablecer" regresa todo a automático.</p>
+  <div class="row inline"><label for="inAutoLock">Bloquear exposición y balance al iniciar cada punto</label><input id="inAutoLock" type="checkbox" checked></div>
+  </div>
+  <p class="note" style="margin-top:12px">Si ajustas algo a mano, la app ya no toca la exposición al iniciar el punto: se queda con tus valores. "Restablecer" regresa todo a automático.</p>
   <div class="btns" style="margin-top:12px"><button id="btnCamReset">Restablecer</button><button id="btnCloseCam" class="primary">Listo</button></div>
 </div>
 
@@ -178,7 +310,7 @@
         <option value="5760" selected>5760 × 2880 (recomendado)</option>
         <option value="8192">8192 × 4096 (solo Android; en iPhone puede fallar)</option>
       </select></div>
-    <div class="row inline"><label>Afinar alineación con puntos de la imagen (descarga ~10 MB la primera vez)</label><input id="inRefine" type="checkbox" checked></div>
+    <div class="row inline"><label for="inRefine">Afinar alineación con puntos de la imagen</label><input id="inRefine" type="checkbox" checked></div>
     <button id="btnStitch" class="primary" style="width:100%">Crear 360 aquí</button>
     <div id="stitchProg" style="display:none">
       <div class="note" id="stitchStage">Preparando…</div>
@@ -187,21 +319,23 @@
     <div id="stitchResult" style="display:none">
       <canvas id="viewer" width="480" height="640"></canvas>
       <p class="note" id="stitchInfo"></p>
-      <div class="btns" style="margin:10px 0">
-        <button id="btnJpg" class="primary">Descargar JPG 360</button>
-        <button id="btnShareJpg">Compartir JPG</button>
+      <div class="acciones-punto" style="margin-bottom:10px">
+        <button id="btnJpg" class="primary ancho"><svg class="ico" style="vertical-align:-4px;margin-right:8px"><use href="#i-bajar"/></svg>Descargar JPG 360</button>
+        <button id="btnShareJpg" class="ancho"><svg class="ico" style="vertical-align:-4px;margin-right:8px"><use href="#i-compartir"/></svg>Compartir JPG</button>
       </div>
     </div>
   </div>
 
-  <div class="btns" style="margin:14px 0 10px">
-    <button id="btnZip">ZIP (fotos + Hugin)</button>
+  <section class="grupo"><h3>Fotos originales</h3>
+  <div class="acciones-punto">
+    <button id="btnZip"><svg class="ico" style="vertical-align:-4px;margin-right:6px"><use href="#i-zip"/></svg>Bajar ZIP</button>
     <button id="btnShare">Compartir ZIP</button>
-  </div>
-  <div class="btns">
-    <button id="btnRetake">Seguir tomando</button>
+  </div></section>
+  <section class="grupo" id="grpNext"><h3>Siguiente paso</h3>
+  <div class="acciones-punto">
+    <button id="btnRetake" class="ghost">Seguir tomando</button>
     <button id="btnNext">Siguiente punto →</button>
-  </div>
+  </div></section>
   <p class="note" style="margin-top:12px">Guarda el JPG (o el ZIP) antes de pasar al siguiente punto: las fotos solo viven en la memoria del navegador.</p>
 </div>
 
@@ -1139,7 +1273,9 @@ async function openCamera(deviceId) {
   await applyManualCam();
   updateAEChip();
   const { w, h } = frameDims();
-  $('chipRes').textContent = `${Math.min(w,h)}×${Math.max(w,h)}`;
+  const resTxt = `${Math.min(w,h)}×${Math.max(w,h)}`;
+  $('chipRes').textContent = 'Resolución baja · ' + resTxt; $('chipRes').className = 'chip' + (Math.min(w, h) < 2000 ? ' bad' : '');
+  $('resNow').textContent = '· ahora ' + resTxt;
   rebuildPlan();
 }
 async function listCameras() {
@@ -1176,7 +1312,7 @@ async function setCameraMode(mode) {
 function updateAEChip() {
   const c = $('chipAE');
   const manual = Object.keys(cfg.cam).length > 0;
-  c.textContent = manual ? '📷 Manual' : S.aeLocked ? '📷 Exposición bloqueada' : '📷 Exposición auto';
+  c.textContent = manual ? 'Manual' : S.aeLocked ? 'Bloqueada' : 'Auto';
   c.className = 'chip ' + (manual || S.aeLocked ? 'ok' : '');
 }
 
@@ -1341,7 +1477,7 @@ function drawMinimapBase() {
   const img = mctx.createImageData(W, H);
   for (let k = 0; k < W * H; k++) {
     const covered = mask[k];
-    img.data[k*4] = covered ? 30 : 40; img.data[k*4+1] = covered ? 170 : 22; img.data[k*4+2] = covered ? 110 : 28; img.data[k*4+3] = 255;
+    img.data[k*4] = covered ? 24 : 22; img.data[k*4+1] = covered ? 104 : 23; img.data[k*4+2] = covered ? 74 : 27; img.data[k*4+3] = 255;
   }
   miniBase = img;
 }
@@ -1355,15 +1491,16 @@ function drawMinimap(pose) {
     const nxt = nextTargetIdx();
     S.plan.targets.forEach((t, i) => {
       const x = (t.yaw + 180) / 360 * W, y = (90 - t.pitch) / 180 * H;
-      mctx.fillStyle = S.captured.has(i) ? '#2ee59d' : i === nxt ? '#ffb020' : '#ffffff';
-      mctx.beginPath(); mctx.arc(x, Math.min(H - 2, Math.max(2, y)), i === nxt ? 3.5 : 2, 0, 7); mctx.fill();
+      mctx.fillStyle = S.captured.has(i) ? '#2ee59d' : i === nxt ? '#ffad1f' : 'rgba(243,242,238,.55)';
+      mctx.beginPath(); mctx.arc(x, Math.min(H - 2, Math.max(2, y)), i === nxt ? 4 : 2, 0, 7); mctx.fill();
     });
   }
   if (pose) {
     const ry = wrap180(pose.yaw - (S.started ? S.yaw0 : pose.yaw));
     const x = (ry + 180) / 360 * W, y = (90 - pose.pitch) / 180 * H;
-    mctx.strokeStyle = '#fff'; mctx.lineWidth = 1.5;
-    mctx.beginPath(); mctx.arc(x, y, 5, 0, 7); mctx.stroke();
+    mctx.strokeStyle = '#f3f2ee'; mctx.lineWidth = 1.5;
+    mctx.beginPath(); mctx.arc(x, y, 6, 0, 7); mctx.stroke();
+    mctx.beginPath(); mctx.moveTo(x - 9, y); mctx.lineTo(x - 6, y); mctx.moveTo(x + 6, y); mctx.lineTo(x + 9, y); mctx.stroke();
   }
 }
 
@@ -1387,16 +1524,26 @@ function loop(ts) {
 
   const levelOk = Math.abs(pose.pitch) > 75 || Math.abs(pose.roll) < 4;
   const lv = $('chipLevel');
-  lv.textContent = Math.abs(pose.pitch) > 75 ? 'Nivel —' : `Nivel ${pose.roll.toFixed(1)}°`;
+  lv.textContent = Math.abs(pose.pitch) > 75 ? '—' : `${pose.roll >= 0 ? '' : '−'}${Math.abs(pose.roll).toFixed(1)}°`;
   lv.className = 'chip ' + (levelOk ? 'ok' : 'bad');
 
   const cx = W / 2, cy = H / 2, focal = screenFocal();
   const tolPx = focal * Math.tan(cfg.tol * D2R);
 
-  // crosshair
-  octx.strokeStyle = '#ffffffcc'; octx.lineWidth = 2;
-  octx.beginPath(); octx.arc(cx, cy, tolPx, 0, 7); octx.stroke();
-  octx.beginPath(); octx.moveTo(cx - 10, cy); octx.lineTo(cx + 10, cy); octx.moveTo(cx, cy - 10); octx.lineTo(cx, cy + 10); octx.stroke();
+  // Retícula: círculo de tolerancia + horizonte artificial (como la burbuja de un nivel). La línea gira con el cel;
+  // en verde cuando está a nivel. Las marcas fijas a los lados son la referencia horizontal de la pantalla.
+  const lvlCol = levelOk ? '#2ee59d' : '#ff5f57';
+  octx.lineCap = 'round';
+  octx.strokeStyle = 'rgba(0,0,0,.35)'; octx.lineWidth = 4; octx.beginPath(); octx.arc(cx, cy, tolPx, 0, 7); octx.stroke();
+  octx.strokeStyle = 'rgba(243,242,238,.9)'; octx.lineWidth = 1.5; octx.beginPath(); octx.arc(cx, cy, tolPx, 0, 7); octx.stroke();
+  const hr = Math.max(tolPx + 26, 46), rollR = Math.abs(pose.pitch) > 75 ? 0 : pose.roll * D2R;
+  octx.strokeStyle = 'rgba(243,242,238,.55)'; octx.lineWidth = 1.5;
+  octx.beginPath(); octx.moveTo(cx - hr - 12, cy); octx.lineTo(cx - hr - 2, cy); octx.moveTo(cx + hr + 2, cy); octx.lineTo(cx + hr + 12, cy); octx.stroke();
+  octx.save(); octx.translate(cx, cy); octx.rotate(-rollR);
+  octx.strokeStyle = 'rgba(0,0,0,.35)'; octx.lineWidth = 4.5; octx.beginPath(); octx.moveTo(-hr, 0); octx.lineTo(-tolPx - 6, 0); octx.moveTo(tolPx + 6, 0); octx.lineTo(hr, 0); octx.stroke();
+  octx.strokeStyle = lvlCol; octx.lineWidth = 2.5; octx.beginPath(); octx.moveTo(-hr, 0); octx.lineTo(-tolPx - 6, 0); octx.moveTo(tolPx + 6, 0); octx.lineTo(hr, 0); octx.stroke();
+  octx.restore();
+  octx.fillStyle = 'rgba(243,242,238,.9)'; octx.beginPath(); octx.arc(cx, cy, 2.5, 0, 7); octx.fill();
 
   if (S.calib) { drawCalib(pose); return; }
 
@@ -1414,16 +1561,17 @@ function loop(ts) {
     if (!S.captured.has(i) && ang < cfg.tol && (aligned < 0 || i === nxt)) aligned = i;
     if (p.behind || p.sx < -60 || p.sx > W + 60 || p.sy < -60 || p.sy > H + 60) return;
     if (S.captured.has(i)) {
-      octx.fillStyle = '#2ee59d55'; octx.strokeStyle = '#2ee59d';
-      octx.beginPath(); octx.arc(p.sx, p.sy, 14, 0, 7); octx.fill(); octx.stroke();
+      octx.fillStyle = 'rgba(46,229,157,.28)'; octx.strokeStyle = '#2ee59d'; octx.lineWidth = 2;
+      octx.beginPath(); octx.arc(p.sx, p.sy, 13, 0, 7); octx.fill(); octx.stroke();
+      octx.beginPath(); octx.moveTo(p.sx - 5, p.sy); octx.lineTo(p.sx - 1.5, p.sy + 4); octx.lineTo(p.sx + 5.5, p.sy - 4); octx.stroke();
     } else if (i === nxt) {
-      const pulse = 22 + 4 * Math.sin(ts / 180);
-      octx.strokeStyle = '#ffb020'; octx.lineWidth = 4;
-      octx.beginPath(); octx.arc(p.sx, p.sy, pulse, 0, 7); octx.stroke();
-      octx.fillStyle = '#ffb020'; octx.beginPath(); octx.arc(p.sx, p.sy, 6, 0, 7); octx.fill();
+      const pulse = 22 + 3 * Math.sin(ts / 220);
+      octx.strokeStyle = 'rgba(0,0,0,.35)'; octx.lineWidth = 6; octx.beginPath(); octx.arc(p.sx, p.sy, pulse, 0, 7); octx.stroke();
+      octx.strokeStyle = '#ffad1f'; octx.lineWidth = 3.5; octx.beginPath(); octx.arc(p.sx, p.sy, pulse, 0, 7); octx.stroke();
+      octx.fillStyle = '#ffad1f'; octx.beginPath(); octx.arc(p.sx, p.sy, 5, 0, 7); octx.fill();
     } else {
-      octx.strokeStyle = '#ffffffaa'; octx.lineWidth = 2;
-      octx.beginPath(); octx.arc(p.sx, p.sy, 12, 0, 7); octx.stroke();
+      octx.strokeStyle = 'rgba(243,242,238,.6)'; octx.lineWidth = 1.5; octx.setLineDash([3, 4]);
+      octx.beginPath(); octx.arc(p.sx, p.sy, 11, 0, 7); octx.stroke(); octx.setLineDash([]);
     }
   });
 
@@ -1437,7 +1585,8 @@ function loop(ts) {
       const R = Math.min(W, H) * 0.38;
       const ax = cx + Math.cos(ang) * R, ay = cy + Math.sin(ang) * R;
       octx.save(); octx.translate(ax, ay); octx.rotate(ang);
-      octx.fillStyle = '#ffb020'; octx.beginPath(); octx.moveTo(22, 0); octx.lineTo(-12, -16); octx.lineTo(-12, 16); octx.closePath(); octx.fill();
+      octx.fillStyle = '#ffad1f'; octx.strokeStyle = 'rgba(0,0,0,.35)'; octx.lineWidth = 3; octx.lineJoin = 'round';
+      octx.beginPath(); octx.moveTo(20, 0); octx.lineTo(-10, -14); octx.lineTo(-4, 0); octx.lineTo(-10, 14); octx.closePath(); octx.stroke(); octx.fill();
       octx.restore();
     }
     let txt;
@@ -1459,7 +1608,7 @@ function loop(ts) {
   if (cfg.auto && aligned >= 0 && levelOk && steady && !S.busy) {
     if (S.alignedIdx !== aligned) { S.alignedIdx = aligned; S.alignedSince = ts; }
     const hold = ts - S.alignedSince;
-    octx.strokeStyle = '#2ee59d'; octx.lineWidth = 5;
+    octx.strokeStyle = '#2ee59d'; octx.lineWidth = 4; octx.lineCap = 'round';
     octx.beginPath(); octx.arc(cx, cy, tolPx + 8, -Math.PI/2, -Math.PI/2 + Math.min(1, hold / 400) * Math.PI * 2); octx.stroke();
     if (hold > 400) capture(aligned);
   } else { S.alignedIdx = -1; }
@@ -1550,7 +1699,7 @@ function showDone() {
   const mb = S.shots.reduce((a, s) => a + s.blob.size, 0) / 1048576;
   const total = S.external ? S.externalTotal : (S.plan ? S.plan.targets.length : S.shots.length);
   $('doneTitle').textContent = S.external === 'zip' ? 'Punto desde ZIP' : S.external === 'recover' ? 'Punto recuperado' : S.captured.size === total ? 'Punto completo' : 'Exportar punto';
-  $('btnRetake').style.display = S.external ? 'none' : ''; $('btnNext').style.display = S.external ? 'none' : '';
+  $('grpNext').style.display = S.external ? 'none' : '';
   $('doneInfo').textContent = S.external
     ? `${S.shots.length} fotos · ${mb.toFixed(1)} MB · ${S.external === 'zip' ? 'cargado desde el ZIP' : 'recuperado de la memoria del cel'}. Puedes crear la 360 y descargarla; para tomar más fotos, inicia un punto nuevo.`
     : `${S.shots.length} fotos · ${mb.toFixed(1)} MB · exposición ${S.aeLocked ? 'bloqueada' : 'automática (puede variar entre fotos)'}`;
@@ -1576,6 +1725,9 @@ function resetStitchUI() {
   if (stitchWorker) { stitchWorker.terminate(); stitchWorker = null; }
   $('stitchProg').style.display = 'none'; $('stitchResult').style.display = 'none';
   $('btnStitch').disabled = false; $('btnStitch').style.display = '';
+  // sin resultado: las opciones y "Crear 360" mandan
+  $('btnStitch').className = 'primary'; $('btnStitch').textContent = 'Crear 360 aquí';
+  $('stitchBox').insertBefore($('stitchResult'), null);
 }
 function rotZ(v, th) { const c = Math.cos(th), s = Math.sin(th); return [v[0]*c - v[1]*s, v[0]*s + v[1]*c, v[2]]; }
 async function decodeShot(blob, w, h) {
@@ -1650,7 +1802,9 @@ function finishStitch(m, secs, warn) {
   if (warn) info += ' · ' + warn;
   $('stitchInfo').textContent = info;
   $('stitchProg').style.display = 'none'; $('stitchResult').style.display = '';
-  $('btnStitch').style.display = ''; $('btnStitch').textContent = 'Volver a crear 360';
+  $('btnStitch').style.display = ''; $('btnStitch').textContent = 'Volver a crear con otras opciones';
+  // con resultado: el visor y la descarga suben; volver a crear queda como acción secundaria
+  $('btnStitch').className = 'ghost'; $('stitchBox').insertBefore($('stitchResult'), $('stitchBox').firstChild);
   drawViewer(); beep(1040);
 }
 function drawViewer() {
@@ -1740,16 +1894,17 @@ async function offlineState() {
 }
 async function renderOffline() {
   const st = await offlineState(); let txt, ok = false;
-  if (!st.cachesApi) txt = '❌ Este navegador no permite guardar la app. En iPhone ábrela en Safari y usa Compartir → Agregar a inicio.';
-  else if (offlineBusy) txt = '⬇ Descargando el motor de alineación (~10 MB)…';
-  else if (st.shell && st.cv) { ok = true; txt = '✅ Lista para usar sin internet'; if (isIOS && !isStandalone()) txt += ' · Agrégala a inicio desde Safari para que iOS no la borre'; }
+  if (!st.cachesApi) txt = 'Este navegador no permite guardar la app. En iPhone ábrela en Safari y usa Compartir → Agregar a inicio.';
+  else if (offlineBusy) txt = 'Descargando el motor de alineación (~10 MB)…';
+  else if (st.shell && st.cv) { ok = true; txt = 'Lista para usar sin internet'; if (isIOS && !isStandalone()) txt += ' · agrégala a inicio desde Safari para que iOS no la borre'; }
   else {
     const falta = [!st.shell && (st.sw ? 'la app' : 'la app (este navegador no la puede guardar; usa Safari)'), !st.cv && 'el motor de alineación'].filter(Boolean).join(' y ');
-    txt = `⚠ Sin internet todavía no funciona: falta guardar ${falta}. ${navigator.onLine ? 'Toca "Preparar".' : 'Necesitas señal para prepararla.'}`;
+    txt = `Sin internet todavía no funciona: falta guardar ${falta}. ${navigator.onLine ? 'Toca "Preparar".' : 'Necesitas señal para prepararla.'}`;
   }
   if (offlineMsg) txt += ' · ' + offlineMsg;
   $('offlineStatus').textContent = txt; $('offlineStart').textContent = txt;
-  $('offlineStatus').style.color = ok ? 'var(--ok)' : 'var(--txt)';
+  $('offlineStatus').className = $('offlineStart').className = 'estado' + (ok ? ' listo' : '');
+  $('btnOfflineStart').style.display = !ok && st.cachesApi && !offlineBusy && navigator.onLine ? '' : 'none';
   return ok;
 }
 async function prepareOffline(manual) {
@@ -1812,10 +1967,11 @@ async function checkRecover() {
     if (!meta || !shots || !shots.length) return;
     shots.sort((a, b) => a.idx - b.idx);
     const mins = Math.round((Date.now() - meta.created) / 60000), hace = mins < 60 ? `hace ${mins} min` : `hace ${Math.round(mins / 60)} h`;
-    $('recoverText').textContent = `Hay un punto sin terminar: ${meta.point}, ${shots.length} fotos (${hace}).`;
-    $('recoverBox').style.display = '';
-    $('btnRecover').onclick = () => { $('recoverBox').style.display = 'none'; loadExternalPoint({ kind: 'recover', name: meta.point, H: meta.H, V: meta.V, yaw0: meta.yaw0, total: meta.total, shots }); };
-    $('btnRecoverDrop').onclick = async () => { if (!confirm(`¿Borrar las ${shots.length} fotos guardadas de ${meta.point}? No se puede deshacer.`)) return; await dbClearPoint(); $('recoverBox').style.display = 'none'; };
+    $('recoverText').textContent = `${meta.point} · ${shots.length} ${shots.length === 1 ? 'foto' : 'fotos'} · ${hace}`;
+    $('recoverBox').style.display = ''; $('btnEnable').className = ''; // recuperar es la acción principal
+    const hideBox = () => { $('recoverBox').style.display = 'none'; $('btnEnable').className = 'primary'; };
+    $('btnRecover').onclick = () => { hideBox(); loadExternalPoint({ kind: 'recover', name: meta.point, H: meta.H, V: meta.V, yaw0: meta.yaw0, total: meta.total, shots }); };
+    $('btnRecoverDrop').onclick = async () => { if (!confirm(`¿Borrar las ${shots.length} fotos guardadas de ${meta.point}? No se puede deshacer.`)) return; await dbClearPoint(); hideBox(); };
   } catch (e) { console.warn('recuperar', e); }
 }
 
@@ -1934,6 +2090,7 @@ $('inTol').oninput = e => { cfg.tol = +e.target.value; $('tolVal').textContent =
 $('inAuto').onchange = e => { cfg.auto = e.target.checked; saveCfg(); };
 $('inNadir').onchange = e => { cfg.nadir = e.target.checked; saveCfg(); resetPoint(); };
 $('btnOffline').onclick = () => prepareOffline(true);
+$('btnOfflineStart').onclick = () => prepareOffline(true);
 $('btnLoadZip').onclick = () => $('inZip').click();
 $('inZip').onchange = e => { const f = e.target.files && e.target.files[0]; e.target.value = ''; if (f) loadZipFile(f); };
 window.addEventListener('online', () => prepareOffline(false));

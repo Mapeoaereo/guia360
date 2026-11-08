@@ -2,7 +2,7 @@
 // - La app (index.html, manifest, íconos) se guarda al instalar. Con señal se pide primero a la red (para recibir
 //   actualizaciones) con un límite de 4 s; sin señal o con señal mala se usa la copia guardada.
 // - OpenCV (motor de alineación, ~10 MB) se guarda en su propia caché la primera vez y después se sirve desde ahí.
-const VERSION = '235b15da95ec';
+const VERSION = 'd48a4991086a';
 const APP = 'guia360-app-' + VERSION;
 const CV = 'guia360-opencv-v1';
 const SHELL = ['./', './index.html', './manifest.webmanifest', './icon-192.png', './icon-512.png'];
