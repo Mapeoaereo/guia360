@@ -213,7 +213,16 @@
     const f = nz(P.f); let u = [P.u[0] - dot(P.u, f)*f[0], P.u[1] - dot(P.u, f)*f[1], P.u[2] - dot(P.u, f)*f[2]]; u = nz(u);
     P.f = f; P.u = u; P.r = cross(f, u);
   }
-  function camRay(x, y, w, h, F) { return nz([(x - w/2) / F, -(y - h/2) / F, 1]); }
+  // Distorsión radial del lente sobre coordenadas normalizadas (tangente): xd = xu·(1 + k1·ρ² + k2·ρ⁴), ρ² = xu² + yu².
+  // Con fotos reales del gran angular del iPhone, el error crecía de 0.27° al centro a 0.88° en la orilla, siempre hacia afuera.
+  function distortXY(x, y, K) { if (!K) return [x, y]; const r2 = x*x + y*y, f = 1 + K[0]*r2 + K[1]*r2*r2; return [x*f, y*f]; }
+  function undistortXY(xd, yd, K) {
+    if (!K || (!K[0] && !K[1])) return [xd, yd];
+    let x = xd, y = yd;
+    for (let it = 0; it < 8; it++) { const r2 = x*x + y*y, f = 1 + K[0]*r2 + K[1]*r2*r2; x = xd / f; y = yd / f; }
+    return [x, y];
+  }
+  function camRay(x, y, w, h, F, K) { const [xu, yu] = undistortXY((x - w/2) / F, -(y - h/2) / F, K); return nz([xu, yu, 1]); }
   function toWorld(P, c) { return [c[0]*P.r[0] + c[1]*P.u[0] + c[2]*P.f[0], c[0]*P.r[1] + c[1]*P.u[1] + c[2]*P.f[1], c[0]*P.r[2] + c[1]*P.u[2] + c[2]*P.f[2]]; }
   function solve(A, b) { // Gaussian elimination with partial pivoting; A is array of rows (modified)
     const n = b.length;
@@ -242,8 +251,17 @@
     for (let i = 0; i < n; i++) {
       const { gray, gw, gh } = grayFrom(imgs[i]);
       const mat = cv.matFromArray(gh, gw, cv.CV_8UC1, gray);
-      const orb = new cv.ORB(1500), kp = new cv.KeyPointVector(), des = new cv.Mat(), mask = new cv.Mat();
+      let orb = new cv.ORB(1500), kp = new cv.KeyPointVector(), des = new cv.Mat(), mask = new cv.Mat();
       orb.detectAndCompute(mat, mask, kp, des);
+      // Superficies lisas (techo blanco): con el umbral normal salen pocos puntos; se repite con un umbral FAST bajo
+      if (kp.size() < 600) {
+        try {
+          const orb2 = new cv.ORB(1500, 1.2, 8, 31, 0, 2, cv.ORB_HARRIS_SCORE, 31, 5), kp2 = new cv.KeyPointVector(), des2 = new cv.Mat();
+          orb2.detectAndCompute(mat, mask, kp2, des2);
+          if (kp2.size() > kp.size()) { kp.delete(); des.delete(); kp = kp2; des = des2; } else { kp2.delete(); des2.delete(); }
+          orb2.delete();
+        } catch (e) { /* si esta versión de OpenCV no acepta los parámetros, se queda con los puntos normales */ }
+      }
       const pts = new Float32Array(kp.size() * 2);
       for (let k = 0; k < kp.size(); k++) { const p = kp.get(k).pt; pts[2*k] = p.x; pts[2*k+1] = p.y; }
       feats.push({ pts, des, gw, gh, F: (gw / 2) / tanH });
@@ -252,6 +270,10 @@
     }
     const vHalf = Math.atan(tanH * Math.max(imgs[0].w, imgs[0].h) / Math.min(imgs[0].w, imgs[0].h));
     const bf = new cv.BFMatcher(cv.NORM_HAMMING, false);
+    // Cerca del cenit o del nadir el giroscopio no sabe bien el giro (la brújula pierde referencia):
+    // a esas fotos se les acepta más desacuerdo con el giroscopio al emparejar y se les da un prior débil en el giro vertical.
+    const nearPole = imgs.map(im => Math.abs(im.f[2]) > 0.94); // |pitch| > ~70°
+    const gyroTol = (i, j) => (nearPole[i] || nearPole[j] ? 30 : 8) * D2R;
     const matches = []; let pairCount = 0, pi = 0; const totalPairs = n * (n - 1) / 2;
     for (let i = 0; i < n; i++) for (let j = i + 1; j < n; j++) {
       pi++;
@@ -266,7 +288,7 @@
         if (a.distance < 0.8 * b.distance) {
           const ax = A.pts[2*a.queryIdx], ay = A.pts[2*a.queryIdx+1], bx = B.pts[2*a.trainIdx], by = B.pts[2*a.trainIdx+1];
           const wa = toWorld(imgs[i], camRay(ax, ay, A.gw, A.gh, A.F)), wb = toWorld(imgs[j], camRay(bx, by, B.gw, B.gh, B.F));
-          if (ang(wa, wb) < 8 * D2R) cand.push({ i, j, ax, ay, bx, by, d: a.distance });
+          if (ang(wa, wb) < gyroTol(i, j)) cand.push({ i, j, ax, ay, bx, by, d: a.distance });
         }
         m.delete();
       }
@@ -281,39 +303,45 @@
     if (matches.length < 20) return { ok: false, reason: 'pocos puntos en común', matches: matches.length };
 
     // Gauss-Newton with Huber, gyro prior, image 0 fixed
-    const P = 3 * (n - 1) + 1, FI = P - 1;
+    // Parámetros: rotación de cada foto (menos la 0), escala de focal compartida y distorsión compartida (k1, k2)
+    const useK = job.distortion !== false;
+    const P = 3 * (n - 1) + 3, FI = P - 3, K1I = P - 2, K2I = P - 1;
     const acc = imgs.map(() => [0, 0, 0]);
-    let s = 1;
+    let s = 1, K = [0, 0];
     const wM = 1 / (0.002 * 0.002), wPrior = 1 / (0.04 * 0.04), wF = 1 / (0.08 * 0.08), huber = 0.003;
+    const wK1 = useK ? 1 / (0.05 * 0.05) : 1e12, wK2 = useK ? 1 / (0.02 * 0.02) : 1e12;
     let active = matches;
-    const resid = (m, sc) => {
+    const resid = (m, sc, Kx) => {
       const A = feats[m.i], B = feats[m.j];
-      const ca = camRay(m.ax, m.ay, A.gw, A.gh, A.F * sc), cb = camRay(m.bx, m.by, B.gw, B.gh, B.F * sc);
+      const ca = camRay(m.ax, m.ay, A.gw, A.gh, A.F * sc, Kx), cb = camRay(m.bx, m.by, B.gw, B.gh, B.F * sc, Kx);
       const wa = toWorld(imgs[m.i], ca), wb = toWorld(imgs[m.j], cb);
       return { wa, wb, e: [wa[0]-wb[0], wa[1]-wb[1], wa[2]-wb[2]] };
     };
-    const errDeg = list => median(list.map(m => norm(resid(m, s).e))) * R2D;
+    const errDeg = list => median(list.map(m => norm(resid(m, s, K).e))) * R2D;
     const before = errDeg(matches);
     for (let it = 0; it < 14; it++) {
       if (it === 5 || it === 9) {
-        const es = active.map(m => norm(resid(m, s).e)), md = median(es);
+        const es = active.map(m => norm(resid(m, s, K).e)), md = median(es);
         active = active.filter((m, k) => es[k] < Math.max(3 * md, 0.004));
       }
       const A = Array.from({ length: P }, () => new Float64Array(P)), b = new Float64Array(P);
       for (const m of active) {
-        const { wa, wb, e } = resid(m, s);
-        const r1 = resid(m, s * (1 + 1e-4)).e, de = [(r1[0]-e[0])/(s*1e-4), (r1[1]-e[1])/(s*1e-4), (r1[2]-e[2])/(s*1e-4)];
+        const { wa, wb, e } = resid(m, s, K);
+        const num = (r1, h) => [(r1[0]-e[0])/h, (r1[1]-e[1])/h, (r1[2]-e[2])/h];
+        const de = num(resid(m, s * (1 + 1e-4), K).e, s * 1e-4);
+        const dk1 = num(resid(m, s, [K[0] + 1e-4, K[1]]).e, 1e-4), dk2 = num(resid(m, s, [K[0], K[1] + 1e-4]).e, 1e-4);
         const en = norm(e), w = wM * (en > huber ? huber / en : 1);
         const cols = []; // {idx, c:[3]}
         if (m.i > 0) { const o = 3 * (m.i - 1); // -skew(wa) columns
           cols.push({ idx: o, c: [0, -wa[2], wa[1]] }, { idx: o + 1, c: [wa[2], 0, -wa[0]] }, { idx: o + 2, c: [-wa[1], wa[0], 0] }); }
         if (m.j > 0) { const o = 3 * (m.j - 1); // +skew(wb) columns
           cols.push({ idx: o, c: [0, wb[2], -wb[1]] }, { idx: o + 1, c: [-wb[2], 0, wb[0]] }, { idx: o + 2, c: [wb[1], -wb[0], 0] }); }
-        cols.push({ idx: FI, c: de });
+        cols.push({ idx: FI, c: de }, { idx: K1I, c: dk1 }, { idx: K2I, c: dk2 });
         for (const p of cols) { b[p.idx] += w * dot(p.c, e); for (const q of cols) A[p.idx][q.idx] += w * dot(p.c, q.c); }
       }
-      for (let i = 1; i < n; i++) for (let k = 0; k < 3; k++) { const o = 3 * (i - 1) + k; A[o][o] += wPrior; b[o] += wPrior * acc[i][k]; }
+      for (let i = 1; i < n; i++) for (let k = 0; k < 3; k++) { const o = 3 * (i - 1) + k, wp = nearPole[i] && k === 2 ? wPrior * 0.01 : wPrior; A[o][o] += wp; b[o] += wp * acc[i][k]; }
       A[FI][FI] += wF; b[FI] += wF * (s - 1);
+      A[K1I][K1I] += wK1; b[K1I] += wK1 * K[0]; A[K2I][K2I] += wK2; b[K2I] += wK2 * K[1];
       for (let k = 0; k < P; k++) A[k][k] *= 1.0001;
       const dx = solve(A.map(r => Array.from(r)), Array.from(b).map(v => -v));
       for (let i = 1; i < n; i++) {
@@ -322,9 +350,16 @@
         acc[i] = [acc[i][0] + d[0], acc[i][1] + d[1], acc[i][2] + d[2]];
       }
       s = Math.max(0.8, Math.min(1.25, s + dx[FI]));
+      if (useK) K = [Math.max(-0.3, Math.min(0.3, K[0] + dx[K1I])), Math.max(-0.15, Math.min(0.15, K[1] + dx[K2I]))];
       progress('Alineando', 0.7 + (it + 1) / 14 * 0.3);
     }
-    return { ok: true, matches: matches.length, used: active.length, pairs: pairCount, errBeforeDeg: before, errAfterDeg: errDeg(active), focalScale: s };
+    // Fotos del cenit/nadir que quedaron con poco apoyo: alinearlas mal duplica objetos (p. ej. la lámpara); mejor no usarlas
+    const support = new Array(n).fill(0); for (const m of active) { support[m.i]++; support[m.j]++; }
+    const dropped = [];
+    for (let i = 1; i < n; i++) if (nearPole[i] && support[i] < (job.minPoleSupport ?? 15)) { imgs[i].skip = true; dropped.push(i); }
+    const out = { ok: true, matches: matches.length, used: active.length, pairs: pairCount, errBeforeDeg: before, errAfterDeg: errDeg(active), focalScale: s, k: K, support, dropped };
+    if (job.diag) out.diag = { matches: active, F: feats.map(f => f.F * s), gw: feats.map(f => f.gw), gh: feats.map(f => f.gh) }; // solo para pruebas
+    return out;
   }
 
   // ---------- 2) Photometric model: per-image gain + shared vignetting, solved jointly ----------
@@ -340,7 +375,7 @@
         const yaw = ((x + 0.5) / GW * 360 - 180) * D2R;
         const d = [Math.cos(pitch) * Math.sin(yaw), Math.cos(pitch) * Math.cos(yaw), Math.sin(pitch)];
         const hit = [];
-        for (let i = 0; i < n; i++) { const s = lumAt(imgs[i], d, F[i]); if (s && s.L > 12 && s.L < 240) hit.push([i, s.L, s.r2]); }
+        for (let i = 0; i < n; i++) { if (imgs[i].skip) continue; const s = lumAt(imgs[i], d, F[i], job.K); if (s && s.L > 12 && s.L < 240) hit.push([i, s.L, s.r2]); }
         for (let a = 0; a < hit.length; a++) for (let b = a + 1; b < hit.length; b++)
           rows.push([hit[a][0], hit[b][0], hit[a][2], hit[b][2], Math.log(hit[a][1]) - Math.log(hit[b][1])]);
       }
@@ -374,9 +409,10 @@
     const gain = x.slice(0, n).map(v => { const g = Math.exp(-(v - meanLg)); return (g > 0.3 && g < 3) ? g : 1; });
     return { gain, vig, pairs: rows.length };
   }
-  function lumAt(img, d, F) {
+  function lumAt(img, d, F, K) {
     const fz = dot(img.f, d); if (fz <= 0) return null;
-    const px = img.w / 2 + dot(img.r, d) / fz * F, py = img.h / 2 - dot(img.u, d) / fz * F;
+    const [qx, qy] = distortXY(dot(img.r, d) / fz, dot(img.u, d) / fz, K);
+    const px = img.w / 2 + qx * F, py = img.h / 2 - qy * F;
     if (px < 2 || py < 2 || px > img.w - 3 || py > img.h - 3) return null;
     const k = ((py | 0) * img.w + (px | 0)) * 4, D = img.rgba;
     const dx = px - img.w / 2, dy = py - img.h / 2, r2 = (dx * dx + dy * dy) / ((img.w / 2) ** 2 + (img.h / 2) ** 2);
@@ -384,7 +420,7 @@
   }
 
   // Versión de baja frecuencia de cada foto (1/8 de tamaño, desenfocada) para la mezcla en dos bandas
-  const LOWK = 8;
+  let LOWK = 8;
   function makeLow(im) {
     const lw = Math.ceil(im.w / LOWK), lh = Math.ceil(im.h / LOWK), a = new Float32Array(lw * lh * 3), cnt = new Float32Array(lw * lh), D = im.rgba;
     for (let y = 0; y < im.h; y++) { const ly = (y / LOWK) | 0; for (let x = 0; x < im.w; x++) {
@@ -401,24 +437,32 @@
   }
 
   // ---------- 3) Equirectangular render ----------
-  // blend: 'seam' (por defecto) = casi una sola foto por zona, transición angosta; sin doble imagen
-  //        'twoband' = tonos con fundido amplio + detalle por costura (experimental: en la prueba sintética no mejoró y es ~25% más lento)
+  // blend: 'twoband' (por defecto) = tonos con fundido amplio (banda baja a 1/16) + detalle por costura. En la escena sintética
+  //          no se notaba, pero con fotos reales del iPhone (exposición distinta por foto y tono local tipo Smart HDR) quita
+  //          las manchas y bordes de brillo del techo. ~1.7× más lento que 'seam'.
+  //        'seam' = casi una sola foto por zona, transición angosta; sin doble imagen pero deja ver saltos de tono
   //        'feather' = promedio amplio (versión original)
   function render(job, F, phot, progress) {
     const imgs = job.images, n = imgs.length, W = job.outW, H = W / 2, out = new Uint8ClampedArray(W * H * 4);
     const gain = phot.gain, c1 = phot.vig[0], c2 = phot.vig[1], useVig = c1 !== 0 || c2 !== 0;
-    const diag = imgs.map((im, i) => Math.atan(Math.hypot(im.w / 2, im.h / 2) / F[i]));
+    const K = job.K, useK = !!(K && (K[0] || K[1]));
+    // ángulo de la esquina de cada foto (con distorsión, se calcula deshaciendo la distorsión de la esquina)
+    const diag = imgs.map((im, i) => { const [cx, cy] = undistortXY(im.w / 2 / F[i], im.h / 2 / F[i], K); return Math.atan(Math.hypot(cx, cy)) + 0.01; });
     const BS = 32, blockRad = Math.hypot(BS, BS) * (360 / W) * D2R;
     const holes = [40, 40, 44];
-    const mode = job.blend || 'seam', seam = mode !== 'feather', two = mode === 'twoband', tau = job.seamWidth || 0.03;
+    const mode = job.blend || 'twoband', seam = mode !== 'feather', two = mode === 'twoband', tau = job.seamWidth || 0.03;
+    LOWK = job.lowK || 16;
     const low = two ? imgs.map(makeLow) : null;
-    const smp = new Float64Array(3);
+    // Altas luces: al aclarar una foto (ganancia > 1) los tonos se acercan al blanco suavemente en vez de recortarse en 255
+    const knee = job.knee === false ? 1e9 : 205, room = 255 - 205;
+    const soft = v => v <= knee ? v : knee + room * (1 - Math.exp(-(v - knee) / room));
+    const smp = new Float64Array(3), hole = new Uint8Array(W * H);
     for (let by = 0; by < H; by += BS) {
       for (let bx = 0; bx < W; bx += BS) {
         const cyaw = ((bx + BS / 2) / W * 360 - 180) * D2R, cp = (90 - (by + BS / 2) / H * 180) * D2R;
         const cd = [Math.cos(cp) * Math.sin(cyaw), Math.cos(cp) * Math.cos(cyaw), Math.sin(cp)];
         const cand = [];
-        for (let i = 0; i < n; i++) if (ang(cd, imgs[i].f) < diag[i] + blockRad) cand.push(i);
+        for (let i = 0; i < n; i++) if (!imgs[i].skip && ang(cd, imgs[i].f) < diag[i] + blockRad) cand.push(i);
         const yEnd = Math.min(H, by + BS), xEnd = Math.min(W, bx + BS);
         const nc = cand.length, cpx = new Float64Array(nc), cpy = new Float64Array(nc), ce = new Float64Array(nc);
         for (let y = by; y < yEnd; y++) {
@@ -431,8 +475,9 @@
             for (let c = 0; c < nc; c++) {
               const i = cand[c], im = imgs[i]; ce[c] = -1;
               const fz = im.f[0]*d0 + im.f[1]*d1 + im.f[2]*d2; if (fz <= 0.05) continue;
-              const px = im.w / 2 + (im.r[0]*d0 + im.r[1]*d1 + im.r[2]*d2) / fz * F[i] - 0.5;
-              const py = im.h / 2 - (im.u[0]*d0 + im.u[1]*d1 + im.u[2]*d2) / fz * F[i] - 0.5;
+              let qx = (im.r[0]*d0 + im.r[1]*d1 + im.r[2]*d2) / fz, qy = (im.u[0]*d0 + im.u[1]*d1 + im.u[2]*d2) / fz;
+              if (useK) { const r2 = qx*qx + qy*qy, fk = 1 + K[0]*r2 + K[1]*r2*r2; qx *= fk; qy *= fk; }
+              const px = im.w / 2 + qx * F[i] - 0.5, py = im.h / 2 - qy * F[i] - 0.5;
               if (px < 0 || py < 0 || px > im.w - 2 || py > im.h - 2) continue;
               const e = Math.min(px + 0.5, im.w - 1.5 - px, py + 0.5, im.h - 1.5 - py) / (0.5 * Math.min(im.w, im.h));
               cpx[c] = px; cpy[c] = py; ce[c] = e; if (e > emax) emax = e;
@@ -465,16 +510,41 @@
               } else { hR += R * ws; hG += Gc * ws; hB += B * ws; hW += ws; }
             }
             const o = (y * W + x) * 4;
-            if (two && lW > 0) { out[o] = lR / lW + (hW ? hR / hW : 0); out[o+1] = lG / lW + (hW ? hG / hW : 0); out[o+2] = lB / lW + (hW ? hB / hW : 0); }
-            else if (!two && hW > 0) { out[o] = hR / hW; out[o+1] = hG / hW; out[o+2] = hB / hW; }
-            else { out[o] = holes[0]; out[o+1] = holes[1]; out[o+2] = holes[2]; }
+            if (two && lW > 0) { out[o] = soft(lR / lW + (hW ? hR / hW : 0)); out[o+1] = soft(lG / lW + (hW ? hG / hW : 0)); out[o+2] = soft(lB / lW + (hW ? hB / hW : 0)); }
+            else if (!two && hW > 0) { out[o] = soft(hR / hW); out[o+1] = soft(hG / hW); out[o+2] = soft(hB / hW); }
+            else { out[o] = holes[0]; out[o+1] = holes[1]; out[o+2] = holes[2]; hole[y * W + x] = 1; }
             out[o+3] = 255;
           }
         }
       }
       progress('Generando 360', (by + BS) / H);
     }
+    if (job.fillPoles !== false) fillPoles(out, hole, W, H);
     return out;
+  }
+  // Huecos en los polos (bajo el tripié o en el cenit): se rellenan desde el último píxel cubierto de cada columna
+  // hacia el color promedio del anillo, con transición suave. Así no queda una franja negra; el logo lo tapa encima.
+  function fillPoles(out, hole, W, H) {
+    for (const bottom of [true, false]) {
+      const edgeY = new Int32Array(W).fill(-1); let sr = 0, sg = 0, sb = 0, cnt = 0;
+      for (let x = 0; x < W; x++) {
+        let y = bottom ? H - 1 : 0; const dy = bottom ? -1 : 1, lim = bottom ? H / 2 : H / 2;
+        if (!hole[y * W + x]) continue;
+        while ((bottom ? y > lim : y < lim) && hole[y * W + x]) y += dy;
+        if (hole[y * W + x]) continue;
+        edgeY[x] = y; const o = (y * W + x) * 4; sr += out[o]; sg += out[o+1]; sb += out[o+2]; cnt++;
+      }
+      if (!cnt) continue;
+      const ring = [sr / cnt, sg / cnt, sb / cnt];
+      for (let x = 0; x < W; x++) {
+        const ey = edgeY[x]; if (ey < 0) continue;
+        const oe = (ey * W + x) * 4, span = bottom ? (H - 1 - ey) : ey;
+        for (let k = 1; k <= span; k++) {
+          const y = bottom ? ey + k : ey - k, t = Math.min(1, k / Math.max(8, span)), o = (y * W + x) * 4;
+          for (let c = 0; c < 3; c++) out[o + c] = out[oe + c] * (1 - t) + ring[c] * t;
+        }
+      }
+    }
   }
 
   function stitchPanorama(job, cv, progress) {
@@ -487,9 +557,10 @@
     const s = stats.refine && stats.refine.ok ? stats.refine.focalScale : 1;
     const tanH = Math.tan(job.hfov * D2R / 2);
     const F = job.images.map(im => (im.w / 2) / tanH * s);
+    job.K = stats.refine && stats.refine.ok && stats.refine.k ? stats.refine.k : (job.K || null);
     progress('Igualando exposición', 0);
     const phot = photometric(job, F);
-    stats.gains = phot.gain.map(g => +g.toFixed(3)); stats.vignette = phot.vig.map(v => +v.toFixed(3)); stats.blend = job.blend || 'seam';
+    stats.gains = phot.gain.map(g => +g.toFixed(3)); stats.vignette = phot.vig.map(v => +v.toFixed(3)); stats.blend = job.blend || 'twoband';
     const rgba = render(job, F, phot, progress);
     stats.ms = Date.now() - t0;
     return { rgba, width: job.outW, height: job.outW / 2, stats };
