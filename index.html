@@ -49,6 +49,16 @@
   #warn { position:fixed; inset:0; background:#000d; z-index:60; display:none; align-items:center; justify-content:center; padding:30px; text-align:center; font-size:18px; font-weight:700; }
   #warn.open { display:flex; }
   #err { color:var(--bad); font-size:14px; max-width:420px; }
+  #chipAE { pointer-events:auto; }
+  .ctl { margin-bottom:14px; text-align:left; }
+  .ctl label { display:flex; justify-content:space-between; font-size:13px; color:var(--mut); margin-bottom:6px; }
+  .ctl label b { color:var(--txt); }
+  .ctl input[type=range] { width:100%; }
+  .ctl select { width:100%; font:inherit; padding:10px; border-radius:10px; border:1px solid #ffffff22; background:#1c1c22; color:var(--txt); }
+  .bar { height:10px; border-radius:6px; background:#ffffff1a; overflow:hidden; margin:8px 0 4px; }
+  .bar > div { height:100%; width:0; background:var(--ok); transition:width .2s; }
+  #viewer { width:100%; aspect-ratio:3/4; max-height:52vh; border-radius:12px; background:#111; touch-action:none; display:block; margin:10px 0; }
+  #stitchBox { border-top:1px solid #ffffff1a; margin-top:14px; padding-top:14px; }
 </style>
 </head>
 <body>
@@ -107,6 +117,7 @@
     <button id="btnCalib">Calibrar campo de visión</button></div>
   <div class="row"><label>Traslape entre fotos: <b id="ovVal">30</b>%</label><input id="inOv" type="range" min="20" max="45" value="30"></div>
   <div class="row"><label>Tolerancia de alineación: <b id="tolVal">3</b>°</label><input id="inTol" type="range" min="1" max="6" value="3"></div>
+  <div class="row"><button id="btnCamPanel">📷 Controles de cámara (exposición, ISO, balance, enfoque)</button></div>
   <div class="row inline"><label>Disparo automático al alinear</label><input id="inAuto" type="checkbox" checked></div>
   <div class="row inline"><label>Incluir foto del piso (nadir)</label><input id="inNadir" type="checkbox"></div>
   <div class="row"><div id="plansum"></div></div>
@@ -114,19 +125,313 @@
   <div class="btns" style="margin-top:14px"><button id="btnCloseSettings" class="primary">Listo</button></div>
 </div>
 
+<div id="camsheet" class="sheet">
+  <h2>Controles de cámara</h2>
+  <div id="camControls"></div>
+  <div class="ctl"><label>Resolución de captura</label>
+    <select id="inRes">
+      <option value="max">Máxima disponible</option>
+      <option value="4k">4K (3840×2160)</option>
+      <option value="1080">1080p (más rápido, menos detalle)</option>
+    </select></div>
+  <div class="row inline"><label>Bloquear exposición y balance al iniciar cada punto</label><input id="inAutoLock" type="checkbox" checked></div>
+  <p class="note">Si ajustas algo a mano, la app ya no toca la exposición al iniciar el punto: se queda con tus valores. "Restablecer" regresa todo a automático.</p>
+  <div class="btns" style="margin-top:12px"><button id="btnCamReset">Restablecer</button><button id="btnCloseCam" class="primary">Listo</button></div>
+</div>
+
 <div id="done" class="sheet">
   <h2 id="doneTitle">Punto completo</h2>
   <p class="note" id="doneInfo"></p>
-  <div class="btns" style="margin:12px 0">
-    <button id="btnZip" class="primary">Descargar ZIP</button>
-    <button id="btnShare">Compartir / Guardar en Archivos</button>
+
+  <div id="stitchBox">
+    <div class="ctl"><label>Tamaño de la 360</label>
+      <select id="inOutW">
+        <option value="4096">4096 × 2048 (rápido)</option>
+        <option value="5760" selected>5760 × 2880 (recomendado)</option>
+        <option value="8192">8192 × 4096 (solo Android; en iPhone puede fallar)</option>
+      </select></div>
+    <div class="row inline"><label>Afinar alineación con puntos de la imagen (descarga ~10 MB la primera vez)</label><input id="inRefine" type="checkbox" checked></div>
+    <button id="btnStitch" class="primary" style="width:100%">Crear 360 aquí</button>
+    <div id="stitchProg" style="display:none">
+      <div class="note" id="stitchStage">Preparando…</div>
+      <div class="bar"><div id="stitchBar"></div></div>
+    </div>
+    <div id="stitchResult" style="display:none">
+      <canvas id="viewer" width="480" height="640"></canvas>
+      <p class="note" id="stitchInfo"></p>
+      <div class="btns" style="margin:10px 0">
+        <button id="btnJpg" class="primary">Descargar JPG 360</button>
+        <button id="btnShareJpg">Compartir JPG</button>
+      </div>
+    </div>
+  </div>
+
+  <div class="btns" style="margin:14px 0 10px">
+    <button id="btnZip">ZIP (fotos + Hugin)</button>
+    <button id="btnShare">Compartir ZIP</button>
   </div>
   <div class="btns">
     <button id="btnRetake">Seguir tomando</button>
     <button id="btnNext">Siguiente punto →</button>
   </div>
-  <p class="note" style="margin-top:12px">Descarga el ZIP antes de pasar al siguiente punto: las fotos solo viven en la memoria del navegador.</p>
+  <p class="note" style="margin-top:12px">Guarda el JPG (o el ZIP) antes de pasar al siguiente punto: las fotos solo viven en la memoria del navegador.</p>
 </div>
+
+<script id="stitchWorkerSrc" type="text/plain">
+// ===== Guia360 stitch core (no DOM; runs in a Web Worker or Node) =====
+// stitchPanorama(job, cv, progress) -> { rgba: Uint8ClampedArray, width, height, stats }
+// job = { outW, refine, hfov, images: [{ w, h, rgba, gw?, gh?, gray?, r:[3], u:[3], f:[3] }] }
+//   hfov = horizontal FOV (deg) of the image width; r/u/f = camera right/up/forward in world (x=E, y=N, z=Up)
+(function (G) {
+  const D2R = Math.PI / 180, R2D = 180 / Math.PI;
+  const dot = (a, b) => a[0]*b[0] + a[1]*b[1] + a[2]*b[2];
+  const cross = (a, b) => [a[1]*b[2]-a[2]*b[1], a[2]*b[0]-a[0]*b[2], a[0]*b[1]-a[1]*b[0]];
+  const norm = a => Math.hypot(a[0], a[1], a[2]);
+  const nz = a => { const n = norm(a) || 1; return [a[0]/n, a[1]/n, a[2]/n]; };
+  const clamp1 = v => Math.max(-1, Math.min(1, v));
+  const ang = (a, b) => Math.acos(clamp1(dot(a, b)));
+
+  function rotVec(v, x) { // Rodrigues: rotate x by rotation vector v
+    const th = norm(v); if (th < 1e-12) return [x[0] + (v[1]*x[2]-v[2]*x[1]), x[1] + (v[2]*x[0]-v[0]*x[2]), x[2] + (v[0]*x[1]-v[1]*x[0])];
+    const k = [v[0]/th, v[1]/th, v[2]/th], c = Math.cos(th), s = Math.sin(th), kx = cross(k, x), kd = dot(k, x);
+    return [x[0]*c + kx[0]*s + k[0]*kd*(1-c), x[1]*c + kx[1]*s + k[1]*kd*(1-c), x[2]*c + kx[2]*s + k[2]*kd*(1-c)];
+  }
+  function orthonorm(P) {
+    const f = nz(P.f); let u = [P.u[0] - dot(P.u, f)*f[0], P.u[1] - dot(P.u, f)*f[1], P.u[2] - dot(P.u, f)*f[2]]; u = nz(u);
+    P.f = f; P.u = u; P.r = cross(f, u);
+  }
+  function camRay(x, y, w, h, F) { return nz([(x - w/2) / F, -(y - h/2) / F, 1]); }
+  function toWorld(P, c) { return [c[0]*P.r[0] + c[1]*P.u[0] + c[2]*P.f[0], c[0]*P.r[1] + c[1]*P.u[1] + c[2]*P.f[1], c[0]*P.r[2] + c[1]*P.u[2] + c[2]*P.f[2]]; }
+  function solve(A, b) { // Gaussian elimination with partial pivoting; A is array of rows (modified)
+    const n = b.length;
+    for (let i = 0; i < n; i++) {
+      let p = i; for (let k = i + 1; k < n; k++) if (Math.abs(A[k][i]) > Math.abs(A[p][i])) p = k;
+      if (Math.abs(A[p][i]) < 1e-18) continue;
+      [A[i], A[p]] = [A[p], A[i]]; [b[i], b[p]] = [b[p], b[i]];
+      for (let k = i + 1; k < n; k++) { const m = A[k][i] / A[i][i]; if (!m) continue; for (let j = i; j < n; j++) A[k][j] -= m * A[i][j]; b[k] -= m * b[i]; }
+    }
+    const x = new Array(n).fill(0);
+    for (let i = n - 1; i >= 0; i--) { if (Math.abs(A[i][i]) < 1e-18) { x[i] = 0; continue; } let s = b[i]; for (let j = i + 1; j < n; j++) s -= A[i][j] * x[j]; x[i] = s / A[i][i]; }
+    return x;
+  }
+  function grayFrom(img) {
+    if (img.gray) return { gray: img.gray, gw: img.gw, gh: img.gh };
+    const n = img.w * img.h, g = new Uint8Array(n), d = img.rgba;
+    for (let i = 0; i < n; i++) g[i] = (d[i*4]*77 + d[i*4+1]*150 + d[i*4+2]*29) >> 8;
+    return { gray: g, gw: img.w, gh: img.h };
+  }
+  const median = a => { if (!a.length) return 0; const s = a.slice().sort((x, y) => x - y); return s[s.length >> 1]; };
+
+  // ---------- 1) Feature-based refinement of rotations + shared focal scale ----------
+  function refine(job, cv, progress) {
+    const imgs = job.images, n = imgs.length, tanH = Math.tan(job.hfov * D2R / 2);
+    const feats = [];
+    for (let i = 0; i < n; i++) {
+      const { gray, gw, gh } = grayFrom(imgs[i]);
+      const mat = cv.matFromArray(gh, gw, cv.CV_8UC1, gray);
+      const orb = new cv.ORB(1500), kp = new cv.KeyPointVector(), des = new cv.Mat(), mask = new cv.Mat();
+      orb.detectAndCompute(mat, mask, kp, des);
+      const pts = new Float32Array(kp.size() * 2);
+      for (let k = 0; k < kp.size(); k++) { const p = kp.get(k).pt; pts[2*k] = p.x; pts[2*k+1] = p.y; }
+      feats.push({ pts, des, gw, gh, F: (gw / 2) / tanH });
+      mat.delete(); kp.delete(); mask.delete(); orb.delete();
+      progress('Detectando puntos', (i + 1) / n * 0.4);
+    }
+    const vHalf = Math.atan(tanH * Math.max(imgs[0].w, imgs[0].h) / Math.min(imgs[0].w, imgs[0].h));
+    const bf = new cv.BFMatcher(cv.NORM_HAMMING, false);
+    const matches = []; let pairCount = 0, pi = 0; const totalPairs = n * (n - 1) / 2;
+    for (let i = 0; i < n; i++) for (let j = i + 1; j < n; j++) {
+      pi++;
+      if (ang(imgs[i].f, imgs[j].f) > 2 * vHalf * 0.95) continue;
+      const A = feats[i], B = feats[j];
+      if (!A.des.rows || !B.des.rows) continue;
+      const mm = new cv.DMatchVectorVector(); bf.knnMatch(A.des, B.des, mm, 2);
+      const cand = [];
+      for (let k = 0; k < mm.size(); k++) {
+        const m = mm.get(k); if (m.size() < 2) { m.delete(); continue; }
+        const a = m.get(0), b = m.get(1);
+        if (a.distance < 0.8 * b.distance) {
+          const ax = A.pts[2*a.queryIdx], ay = A.pts[2*a.queryIdx+1], bx = B.pts[2*a.trainIdx], by = B.pts[2*a.trainIdx+1];
+          const wa = toWorld(imgs[i], camRay(ax, ay, A.gw, A.gh, A.F)), wb = toWorld(imgs[j], camRay(bx, by, B.gw, B.gh, B.F));
+          if (ang(wa, wb) < 8 * D2R) cand.push({ i, j, ax, ay, bx, by, d: a.distance });
+        }
+        m.delete();
+      }
+      mm.delete();
+      if (cand.length >= 10) {
+        cand.sort((p, q) => p.d - q.d);
+        cand.slice(0, 250).forEach(c => matches.push(c)); pairCount++;
+      }
+      if (pi % 8 === 0) progress('Emparejando fotos', 0.4 + pi / totalPairs * 0.3);
+    }
+    bf.delete(); feats.forEach(f => f.des.delete());
+    if (matches.length < 20) return { ok: false, reason: 'pocos puntos en común', matches: matches.length };
+
+    // Gauss-Newton with Huber, gyro prior, image 0 fixed
+    const P = 3 * (n - 1) + 1, FI = P - 1;
+    const acc = imgs.map(() => [0, 0, 0]);
+    let s = 1;
+    const wM = 1 / (0.002 * 0.002), wPrior = 1 / (0.04 * 0.04), wF = 1 / (0.08 * 0.08), huber = 0.003;
+    let active = matches;
+    const resid = (m, sc) => {
+      const A = feats[m.i], B = feats[m.j];
+      const ca = camRay(m.ax, m.ay, A.gw, A.gh, A.F * sc), cb = camRay(m.bx, m.by, B.gw, B.gh, B.F * sc);
+      const wa = toWorld(imgs[m.i], ca), wb = toWorld(imgs[m.j], cb);
+      return { wa, wb, e: [wa[0]-wb[0], wa[1]-wb[1], wa[2]-wb[2]] };
+    };
+    const errDeg = list => median(list.map(m => norm(resid(m, s).e))) * R2D;
+    const before = errDeg(matches);
+    for (let it = 0; it < 14; it++) {
+      if (it === 5 || it === 9) {
+        const es = active.map(m => norm(resid(m, s).e)), md = median(es);
+        active = active.filter((m, k) => es[k] < Math.max(3 * md, 0.004));
+      }
+      const A = Array.from({ length: P }, () => new Float64Array(P)), b = new Float64Array(P);
+      for (const m of active) {
+        const { wa, wb, e } = resid(m, s);
+        const r1 = resid(m, s * (1 + 1e-4)).e, de = [(r1[0]-e[0])/(s*1e-4), (r1[1]-e[1])/(s*1e-4), (r1[2]-e[2])/(s*1e-4)];
+        const en = norm(e), w = wM * (en > huber ? huber / en : 1);
+        const cols = []; // {idx, c:[3]}
+        if (m.i > 0) { const o = 3 * (m.i - 1); // -skew(wa) columns
+          cols.push({ idx: o, c: [0, -wa[2], wa[1]] }, { idx: o + 1, c: [wa[2], 0, -wa[0]] }, { idx: o + 2, c: [-wa[1], wa[0], 0] }); }
+        if (m.j > 0) { const o = 3 * (m.j - 1); // +skew(wb) columns
+          cols.push({ idx: o, c: [0, wb[2], -wb[1]] }, { idx: o + 1, c: [-wb[2], 0, wb[0]] }, { idx: o + 2, c: [wb[1], -wb[0], 0] }); }
+        cols.push({ idx: FI, c: de });
+        for (const p of cols) { b[p.idx] += w * dot(p.c, e); for (const q of cols) A[p.idx][q.idx] += w * dot(p.c, q.c); }
+      }
+      for (let i = 1; i < n; i++) for (let k = 0; k < 3; k++) { const o = 3 * (i - 1) + k; A[o][o] += wPrior; b[o] += wPrior * acc[i][k]; }
+      A[FI][FI] += wF; b[FI] += wF * (s - 1);
+      for (let k = 0; k < P; k++) A[k][k] *= 1.0001;
+      const dx = solve(A.map(r => Array.from(r)), Array.from(b).map(v => -v));
+      for (let i = 1; i < n; i++) {
+        const d = [dx[3*(i-1)], dx[3*(i-1)+1], dx[3*(i-1)+2]];
+        const Pi = imgs[i]; Pi.r = rotVec(d, Pi.r); Pi.u = rotVec(d, Pi.u); Pi.f = rotVec(d, Pi.f); orthonorm(Pi);
+        acc[i] = [acc[i][0] + d[0], acc[i][1] + d[1], acc[i][2] + d[2]];
+      }
+      s = Math.max(0.8, Math.min(1.25, s + dx[FI]));
+      progress('Alineando', 0.7 + (it + 1) / 14 * 0.3);
+    }
+    return { ok: true, matches: matches.length, used: active.length, pairs: pairCount, errBeforeDeg: before, errAfterDeg: errDeg(active), focalScale: s };
+  }
+
+  // ---------- 2) Exposure gain compensation (Brown & Lowe) ----------
+  function gains(job, F) {
+    const imgs = job.images, n = imgs.length, GW = 360, GH = 180;
+    const I = Array.from({ length: n }, () => new Float64Array(n)), N = Array.from({ length: n }, () => new Float64Array(n));
+    for (let y = 0; y < GH; y++) {
+      const pitch = (90 - (y + 0.5) / GH * 180) * D2R;
+      for (let x = 0; x < GW; x++) {
+        const yaw = ((x + 0.5) / GW * 360 - 180) * D2R;
+        const d = [Math.cos(pitch) * Math.sin(yaw), Math.cos(pitch) * Math.cos(yaw), Math.sin(pitch)];
+        const hit = [];
+        for (let i = 0; i < n; i++) { const L = lumAt(imgs[i], d, F[i]); if (L >= 0) hit.push([i, L]); }
+        for (let a = 0; a < hit.length; a++) for (let c = 0; c < hit.length; c++) if (a !== c) { I[hit[a][0]][hit[c][0]] += hit[a][1]; N[hit[a][0]][hit[c][0]]++; }
+      }
+    }
+    const sN = 10, sG = 0.1, A = Array.from({ length: n }, () => new Array(n).fill(0)), b = new Array(n).fill(0);
+    for (let i = 0; i < n; i++) {
+      A[i][i] += 1e-3; b[i] += 1e-3;
+      for (let j = 0; j < n; j++) {
+        if (!N[i][j]) continue;
+        const Iij = I[i][j] / N[i][j], Iji = I[j][i] / N[j][i];
+        A[i][i] += N[i][j] * (Iij * Iij / (sN * sN) + 1 / (sG * sG));
+        A[i][j] -= N[i][j] * Iij * Iji / (sN * sN);
+        b[i] += N[i][j] / (sG * sG);
+      }
+    }
+    return solve(A, b).map(g => (g > 0.3 && g < 3) ? g : 1);
+  }
+  function lumAt(img, d, F) {
+    const fz = dot(img.f, d); if (fz <= 0) return -1;
+    const px = img.w / 2 + dot(img.r, d) / fz * F, py = img.h / 2 - dot(img.u, d) / fz * F;
+    if (px < 2 || py < 2 || px > img.w - 3 || py > img.h - 3) return -1;
+    const k = ((py | 0) * img.w + (px | 0)) * 4, D = img.rgba;
+    return 0.299 * D[k] + 0.587 * D[k + 1] + 0.114 * D[k + 2];
+  }
+
+  // ---------- 3) Equirectangular render with feathered blending ----------
+  function render(job, F, gain, progress) {
+    const imgs = job.images, n = imgs.length, W = job.outW, H = W / 2, out = new Uint8ClampedArray(W * H * 4);
+    const diag = imgs.map((im, i) => Math.atan(Math.hypot(im.w / 2, im.h / 2) / F[i]));
+    const BS = 32, blockRad = Math.hypot(BS, BS) * (360 / W) * D2R;
+    const holes = [40, 40, 44];
+    for (let by = 0; by < H; by += BS) {
+      for (let bx = 0; bx < W; bx += BS) {
+        const cyaw = ((bx + BS / 2) / W * 360 - 180) * D2R, cp = (90 - (by + BS / 2) / H * 180) * D2R;
+        const cd = [Math.cos(cp) * Math.sin(cyaw), Math.cos(cp) * Math.cos(cyaw), Math.sin(cp)];
+        const cand = [];
+        for (let i = 0; i < n; i++) if (ang(cd, imgs[i].f) < diag[i] + blockRad) cand.push(i);
+        const yEnd = Math.min(H, by + BS), xEnd = Math.min(W, bx + BS);
+        for (let y = by; y < yEnd; y++) {
+          const p = (90 - (y + 0.5) / H * 180) * D2R, cpz = Math.cos(p), sp = Math.sin(p);
+          for (let x = bx; x < xEnd; x++) {
+            const yw = ((x + 0.5) / W * 360 - 180) * D2R;
+            const d0 = cpz * Math.sin(yw), d1 = cpz * Math.cos(yw), d2 = sp;
+            let R = 0, Gc = 0, B = 0, Ws = 0;
+            for (const i of cand) {
+              const im = imgs[i];
+              const fz = im.f[0]*d0 + im.f[1]*d1 + im.f[2]*d2; if (fz <= 0.05) continue;
+              const px = im.w / 2 + (im.r[0]*d0 + im.r[1]*d1 + im.r[2]*d2) / fz * F[i] - 0.5;
+              const py = im.h / 2 - (im.u[0]*d0 + im.u[1]*d1 + im.u[2]*d2) / fz * F[i] - 0.5;
+              if (px < 0 || py < 0 || px > im.w - 2 || py > im.h - 2) continue;
+              let e = Math.min(px + 0.5, im.w - 1.5 - px, py + 0.5, im.h - 1.5 - py) / (0.5 * Math.min(im.w, im.h));
+              const w = e * e * e + 1e-9;
+              const x0 = px | 0, y0 = py | 0, fx = px - x0, fy = py - y0, D = im.rgba;
+              const k00 = (y0 * im.w + x0) * 4, k10 = k00 + 4, k01 = k00 + im.w * 4, k11 = k01 + 4;
+              const w00 = (1-fx)*(1-fy), w10 = fx*(1-fy), w01 = (1-fx)*fy, w11 = fx*fy, g = gain[i] * w;
+              R  += (D[k00]*w00 + D[k10]*w10 + D[k01]*w01 + D[k11]*w11) * g;
+              Gc += (D[k00+1]*w00 + D[k10+1]*w10 + D[k01+1]*w01 + D[k11+1]*w11) * g;
+              B  += (D[k00+2]*w00 + D[k10+2]*w10 + D[k01+2]*w01 + D[k11+2]*w11) * g;
+              Ws += w;
+            }
+            const o = (y * W + x) * 4;
+            if (Ws > 0) { out[o] = R / Ws; out[o+1] = Gc / Ws; out[o+2] = B / Ws; }
+            else { out[o] = holes[0]; out[o+1] = holes[1]; out[o+2] = holes[2]; }
+            out[o+3] = 255;
+          }
+        }
+      }
+      progress('Generando 360', (by + BS) / H);
+    }
+    return out;
+  }
+
+  function stitchPanorama(job, cv, progress) {
+    progress = progress || (() => {});
+    const t0 = Date.now(), stats = { images: job.images.length };
+    job.images.forEach(orthonorm);
+    if (job.refine && cv) {
+      try { stats.refine = refine(job, cv, progress); } catch (e) { stats.refine = { ok: false, reason: String(e && e.message || e) }; }
+    } else stats.refine = { ok: false, reason: 'desactivado' };
+    const s = stats.refine && stats.refine.ok ? stats.refine.focalScale : 1;
+    const tanH = Math.tan(job.hfov * D2R / 2);
+    const F = job.images.map(im => (im.w / 2) / tanH * s);
+    progress('Igualando exposición', 0);
+    const gain = gains(job, F); stats.gains = gain.map(g => +g.toFixed(3));
+    const rgba = render(job, F, gain, progress);
+    stats.ms = Date.now() - t0;
+    return { rgba, width: job.outW, height: job.outW / 2, stats };
+  }
+  G.stitchPanorama = stitchPanorama;
+  if (typeof module !== 'undefined' && module.exports) module.exports = { stitchPanorama };
+})(typeof self !== 'undefined' ? self : globalThis);
+
+// OJO: el módulo de OpenCV (Emscripten) tiene un método .then; si se pasa directo a res(), la promesa intenta
+// "adoptarlo" sin fin y nunca se resuelve. Por eso se entrega envuelto en { cv }.
+const waitCv = () => new Promise((res, rej) => { const t0 = Date.now(); (function chk() { if (self.cv && self.cv.Mat && self.cv.ORB) return res({ cv: self.cv }); if (Date.now() - t0 > 90000) return rej(new Error('OpenCV no terminó de cargar')); setTimeout(chk, 100); })(); });
+self.onmessage = async (e) => {
+  const job = e.data; let cv = null;
+  if (job.refine) {
+    self.postMessage({ type: 'progress', stage: 'Cargando motor de alineación', pct: 0 });
+    for (const url of job.cvUrls) { try { importScripts(url); cv = (await waitCv()).cv; break; } catch (err) { cv = null; } }
+    if (!cv) self.postMessage({ type: 'warn', msg: 'No se pudo cargar OpenCV (¿sin internet?). Se unirá solo con el giroscopio.' });
+  }
+  try {
+    const res = stitchPanorama(job, cv, (stage, pct) => self.postMessage({ type: 'progress', stage, pct }));
+    self.postMessage({ type: 'done', rgba: res.rgba.buffer, width: res.width, height: res.height, stats: res.stats }, [res.rgba.buffer]);
+  } catch (err) { self.postMessage({ type: 'error', msg: String(err && err.message || err) }); }
+};
+</script>
 
 <div id="warn">Pon el cel en vertical</div>
 
@@ -265,7 +570,7 @@ const S = {
   busy: false, alignedSince: 0, alignedIdx: -1,
   calib: null, wakeLock: null, audio: null, aeLocked: false
 };
-const cfg = { longFov: 100, ov: 0.30, tol: 3, auto: true, nadir: false, lens: 'uw' };
+const cfg = { longFov: 100, ov: 0.30, tol: 3, auto: true, nadir: false, lens: 'uw', res: 'max', autoLock: true, cam: {}, outW: 5760, refine: true };
 try { Object.assign(cfg, JSON.parse(localStorage.getItem('guia360cfg') || '{}')); } catch (e) {}
 const saveCfg = () => { try { localStorage.setItem('guia360cfg', JSON.stringify(cfg)); } catch (e) {} };
 
@@ -296,6 +601,7 @@ function rebuildPlan() {
 }
 function resetPoint() {
   S.started = false; S.shots = []; S.captured = new Set();
+  if (typeof resetStitchUI === 'function') resetStitchUI();
   $('shoot').classList.add('start'); $('shoot').textContent = 'Iniciar punto';
   rebuildPlan(); drawMinimapBase();
 }
@@ -332,14 +638,17 @@ async function enable() {
 }
 async function openCamera(deviceId) {
   if (S.stream) S.stream.getTracks().forEach(t => t.stop());
-  const v = { width: { ideal: 4096 }, height: { ideal: 3072 } };
+  const RES = { max: [4096, 3072], '4k': [3840, 2160], '1080': [1920, 1080] }[cfg.res] || [4096, 3072];
+  const v = { width: { ideal: RES[0] }, height: { ideal: RES[1] } };
   if (deviceId) v.deviceId = { exact: deviceId }; else v.facingMode = { ideal: 'environment' };
   S.stream = await navigator.mediaDevices.getUserMedia({ video: v, audio: false });
   S.track = S.stream.getVideoTracks()[0];
   video.srcObject = S.stream;
   await video.play().catch(() => {});
   await new Promise(r => { if (video.videoWidth) r(); else video.onloadedmetadata = () => r(); });
-  S.aeLocked = false; updateAEChip();
+  S.aeLocked = false;
+  await applyManualCam();
+  updateAEChip();
   const { w, h } = frameDims();
   $('chipRes').textContent = `${Math.min(w,h)}×${Math.max(w,h)}`;
   rebuildPlan();
@@ -377,8 +686,71 @@ async function setCameraMode(mode) {
 }
 function updateAEChip() {
   const c = $('chipAE');
-  c.textContent = S.aeLocked ? 'Exposición bloqueada' : 'Exposición auto';
-  c.className = 'chip ' + (S.aeLocked ? 'ok' : '');
+  const manual = Object.keys(cfg.cam).length > 0;
+  c.textContent = manual ? '📷 Manual' : S.aeLocked ? '📷 Exposición bloqueada' : '📷 Exposición auto';
+  c.className = 'chip ' + (manual || S.aeLocked ? 'ok' : '');
+}
+
+// ---------- Manual camera controls ----------
+const CAM_NUM = [
+  ['exposureCompensation', 'Compensación de exposición', v => (v > 0 ? '+' : '') + (+v).toFixed(1) + ' EV', null],
+  ['exposureTime', 'Velocidad de obturación', v => { const s = v * 0.0001; return s >= 1 ? s.toFixed(1) + ' s' : '1/' + Math.round(1 / s) + ' s'; }, ['exposureMode', 'manual']],
+  ['iso', 'ISO', v => Math.round(v), ['exposureMode', 'manual']],
+  ['colorTemperature', 'Balance de blancos (temperatura)', v => Math.round(v) + ' K', ['whiteBalanceMode', 'manual']],
+  ['focusDistance', 'Distancia de enfoque', v => (+v).toFixed(2), ['focusMode', 'manual']],
+  ['zoom', 'Zoom', v => (+v).toFixed(1) + '×', null]
+];
+const CAM_MODES = [['exposureMode', 'Modo de exposición'], ['whiteBalanceMode', 'Modo de balance de blancos'], ['focusMode', 'Modo de enfoque']];
+const MODE_ES = { manual: 'Manual (fijo)', continuous: 'Automático continuo', 'single-shot': 'Una vez y fijar', none: 'Ninguno' };
+async function applyCam(obj) {
+  if (!S.track) return false;
+  try { await S.track.applyConstraints({ advanced: [obj] }); return true; } catch (e) { return false; }
+}
+async function applyManualCam() {
+  const c = cfg.cam; if (!Object.keys(c).length || !S.track || !S.track.getCapabilities) return;
+  const caps = S.track.getCapabilities(), obj = {};
+  for (const k of Object.keys(c)) if (k in caps) obj[k] = c[k];
+  if (Object.keys(obj).length) await applyCam(obj);
+}
+function buildCamPanel() {
+  const box = $('camControls'); box.innerHTML = '';
+  const caps = S.track && S.track.getCapabilities ? S.track.getCapabilities() : {};
+  const set = S.track && S.track.getSettings ? S.track.getSettings() : {};
+  let count = 0;
+  for (const [k, label] of CAM_MODES) {
+    if (!Array.isArray(caps[k]) || caps[k].length < 2) continue;
+    count++;
+    const d = document.createElement('div'); d.className = 'ctl';
+    d.innerHTML = `<label>${label}</label><select>${caps[k].map(m => `<option value="${m}" ${set[k] === m ? 'selected' : ''}>${MODE_ES[m] || m}</option>`).join('')}</select>`;
+    d.querySelector('select').onchange = async e => { cfg.cam[k] = e.target.value; saveCfg(); await applyCam({ [k]: e.target.value }); updateAEChip(); buildCamPanel(); };
+    box.appendChild(d);
+  }
+  for (const [k, label, fmt, needs] of CAM_NUM) {
+    const c = caps[k]; if (!c || typeof c.min !== 'number' || c.max <= c.min) continue;
+    count++;
+    const cur = set[k] != null ? set[k] : c.min, step = c.step || (c.max - c.min) / 100;
+    const d = document.createElement('div'); d.className = 'ctl';
+    d.innerHTML = `<label>${label} <b>${fmt(cur)}</b></label><input type="range" min="${c.min}" max="${c.max}" step="${step}" value="${cur}">`;
+    const inp = d.querySelector('input'), lab = d.querySelector('b');
+    inp.oninput = () => { lab.textContent = fmt(+inp.value); };
+    inp.onchange = async () => {
+      const obj = { [k]: +inp.value };
+      if (needs && caps[needs[0]] && caps[needs[0]].includes(needs[1])) { obj[needs[0]] = needs[1]; cfg.cam[needs[0]] = needs[1]; }
+      cfg.cam[k] = +inp.value; saveCfg();
+      const ok = await applyCam(obj); if (!ok) lab.textContent += ' (rechazado)';
+      updateAEChip();
+    };
+    box.appendChild(d);
+  }
+  if (caps.torch) {
+    count++;
+    const d = document.createElement('div'); d.className = 'row inline';
+    d.innerHTML = `<label>Linterna</label><input type="checkbox" ${set.torch ? 'checked' : ''}>`;
+    d.querySelector('input').onchange = e => applyCam({ torch: e.target.checked });
+    box.appendChild(d);
+  }
+  if (!count) box.innerHTML = '<p class="note">Este navegador no da controles manuales de esta cámara. Safari en iPhone casi no expone ninguno; en Android usa Chrome. La resolución sí puedes cambiarla abajo.</p>';
+  $('inRes').value = cfg.res; $('inAutoLock').checked = cfg.autoLock;
 }
 async function requestWake() {
   try { if ('wakeLock' in navigator) S.wakeLock = await navigator.wakeLock.request('screen'); } catch (e) {}
@@ -399,10 +771,13 @@ function nextTargetIdx(pose) {
 async function startPoint() {
   const pose = currentPose();
   if (!pose) { $('hint').textContent = 'Esperando giroscopio…'; return; }
-  S.yaw0 = pose.yaw; S.started = true; S.shots = []; S.captured = new Set();
-  await setCameraMode('continuous');
-  await new Promise(r => setTimeout(r, 600)); // let AE settle on this room
-  S.aeLocked = await setCameraMode('manual'); updateAEChip();
+  S.yaw0 = pose.yaw; S.started = true; S.shots = []; S.captured = new Set(); resetStitchUI();
+  if (cfg.autoLock && !Object.keys(cfg.cam).length) {
+    await setCameraMode('continuous');
+    await new Promise(r => setTimeout(r, 600)); // let AE settle on this room
+    S.aeLocked = await setCameraMode('manual');
+  }
+  updateAEChip();
   $('shoot').classList.remove('start'); $('shoot').textContent = '';
   drawMinimapBase(); updateProgress(); beep(660);
 }
@@ -426,6 +801,7 @@ async function capture(targetIdx) {
       f: pose.f, r: pose.r, u: pose.u
     });
     if (targetIdx >= 0) S.captured.add(targetIdx);
+    if (PANO || stitchWorker) resetStitchUI();
     $('flash').style.opacity = .55; setTimeout(() => $('flash').style.opacity = 0, 90);
     if (navigator.vibrate) navigator.vibrate(40);
     beep(880);
@@ -436,6 +812,7 @@ async function capture(targetIdx) {
 function undo() {
   const s = S.shots.pop(); if (!s) return;
   if (s.target >= 0) S.captured.delete(s.target);
+  if (PANO || stitchWorker) resetStitchUI();
   drawMinimapBase(); updateProgress();
 }
 function beep(freq) {
@@ -684,7 +1061,157 @@ function nextPoint() {
   const v = $('inPoint').value, m = v.match(/^(.*?)(\d+)\s*$/);
   $('inPoint').value = m ? m[1] + String(+m[2] + 1).padStart(m[2].length, '0') : v + ' 2';
   $('pname').textContent = $('inPoint').value;
-  closeSheet('done'); setCameraMode('continuous'); S.aeLocked = false; updateAEChip(); resetPoint();
+  closeSheet('done');
+  if (!Object.keys(cfg.cam).length) setCameraMode('continuous');
+  S.aeLocked = false; updateAEChip(); resetStitchUI(); resetPoint();
+}
+
+// ---------- On-device 360 stitching ----------
+const CV_URLS = [
+  'https://cdn.jsdelivr.net/npm/@techstark/opencv-js@4.10.0-release.1/dist/opencv.js',
+  'https://unpkg.com/@techstark/opencv-js@4.10.0-release.1/dist/opencv.js'
+];
+let PANO = null, stitchWorker = null;
+function resetStitchUI() {
+  PANO = null;
+  if (stitchWorker) { stitchWorker.terminate(); stitchWorker = null; }
+  $('stitchProg').style.display = 'none'; $('stitchResult').style.display = 'none';
+  $('btnStitch').disabled = false; $('btnStitch').style.display = '';
+}
+function rotZ(v, th) { const c = Math.cos(th), s = Math.sin(th); return [v[0]*c - v[1]*s, v[0]*s + v[1]*c, v[2]]; }
+async function decodeShot(blob, w, h) {
+  let src;
+  try { src = await createImageBitmap(blob); }
+  catch (e) { src = await new Promise((res, rej) => { const im = new Image(); im.onload = () => res(im); im.onerror = rej; im.src = URL.createObjectURL(blob); }); }
+  const c = document.createElement('canvas'); c.width = w; c.height = h;
+  const ctx = c.getContext('2d', { willReadFrequently: true });
+  ctx.imageSmoothingQuality = 'high'; ctx.drawImage(src, 0, 0, w, h);
+  if (src.close) src.close();
+  return ctx.getImageData(0, 0, w, h).data;
+}
+async function startStitch() {
+  if (S.shots.length < 3) { $('stitchStage').textContent = 'Faltan fotos.'; return; }
+  const outW = +$('inOutW').value; cfg.outW = outW; cfg.refine = $('inRefine').checked; saveCfg();
+  $('btnStitch').style.display = 'none'; $('stitchProg').style.display = ''; $('stitchResult').style.display = 'none';
+  const setProg = (stage, pct) => { $('stitchStage').textContent = stage; $('stitchBar').style.width = Math.round(Math.max(0, Math.min(1, pct)) * 100) + '%'; };
+  setProg('Preparando fotos…', 0);
+  try {
+    const H = fovs().H, th = S.yaw0 * D2R, images = [], transfer = [];
+    for (let i = 0; i < S.shots.length; i++) {
+      const s = S.shots[i];
+      const pxPerDeg = s.width / H, scale = Math.min(1, (outW / 360) / pxPerDeg * 1.15);
+      const w = Math.max(64, Math.round(s.width * scale)), h = Math.max(64, Math.round(s.height * scale));
+      const rgba = await decodeShot(s.blob, w, h);
+      const img = { w, h, rgba, r: rotZ(s.r, th), u: rotZ(s.u, th), f: rotZ(s.f, th) };
+      if (cfg.refine) {
+        const gs = Math.min(1, 900 / Math.max(s.width, s.height));
+        const gw = Math.round(s.width * gs), gh = Math.round(s.height * gs);
+        const g4 = await decodeShot(s.blob, gw, gh), gray = new Uint8Array(gw * gh);
+        for (let k = 0; k < gray.length; k++) gray[k] = (g4[k*4]*77 + g4[k*4+1]*150 + g4[k*4+2]*29) >> 8;
+        img.gray = gray; img.gw = gw; img.gh = gh; transfer.push(gray.buffer);
+      }
+      images.push(img); transfer.push(rgba.buffer);
+      setProg('Preparando fotos…', (i + 1) / S.shots.length * 0.1);
+    }
+    const blob = new Blob([$('stitchWorkerSrc').textContent], { type: 'text/javascript' });
+    stitchWorker = new Worker(URL.createObjectURL(blob));
+    const t0 = Date.now(); let warn = '';
+    stitchWorker.onmessage = e => {
+      const m = e.data;
+      if (m.type === 'progress') setProg(m.stage + '…', m.pct);
+      else if (m.type === 'warn') warn = m.msg;
+      else if (m.type === 'error') { setProg('Error: ' + m.msg, 0); $('btnStitch').style.display = ''; stitchWorker.terminate(); stitchWorker = null; }
+      else if (m.type === 'done') { stitchWorker.terminate(); stitchWorker = null; finishStitch(m, (Date.now() - t0) / 1000, warn); }
+    };
+    stitchWorker.onerror = e => { setProg('Error en el proceso: ' + (e.message || 'memoria insuficiente'), 0); $('btnStitch').style.display = ''; if (stitchWorker) { stitchWorker.terminate(); stitchWorker = null; } };
+    stitchWorker.postMessage({ outW, refine: cfg.refine, hfov: H, images, cvUrls: CV_URLS }, transfer);
+  } catch (err) {
+    setProg('Error: ' + (err.message || err), 0); $('btnStitch').style.display = '';
+  }
+}
+function finishStitch(m, secs, warn) {
+  const W = m.width, H = m.height;
+  const c = document.createElement('canvas'); c.width = W; c.height = H;
+  c.getContext('2d').putImageData(new ImageData(new Uint8ClampedArray(m.rgba), W, H), 0, 0);
+  // small copy for the viewer
+  const pw = 2048, ph = 1024, pc = document.createElement('canvas'); pc.width = pw; pc.height = ph;
+  const pctx = pc.getContext('2d'); pctx.drawImage(c, 0, 0, pw, ph);
+  PANO = { canvas: c, W, H, prev: pctx.getImageData(0, 0, pw, ph), pw, ph, yaw: 0, pitch: 0, fov: 80 };
+  const r = m.stats.refine || {};
+  let info = `${W}×${H} · ${secs.toFixed(0)} s · `;
+  info += r.ok ? `alineación afinada (error ${r.errBeforeDeg.toFixed(1)}° → ${r.errAfterDeg.toFixed(2)}°, ${r.used} puntos)` : `solo giroscopio (${r.reason || 'sin afinar'})`;
+  if (warn) info += ' · ' + warn;
+  $('stitchInfo').textContent = info;
+  $('stitchProg').style.display = 'none'; $('stitchResult').style.display = '';
+  $('btnStitch').style.display = ''; $('btnStitch').textContent = 'Volver a crear 360';
+  drawViewer(); beep(1040);
+}
+function drawViewer() {
+  if (!PANO) return;
+  const cv = $('viewer'), ctx = cv.getContext('2d'), W = cv.width, H = cv.height;
+  const out = ctx.createImageData(W, H), P = PANO.prev.data, pw = PANO.pw, ph = PANO.ph;
+  const f = (H / 2) / Math.tan(PANO.fov * D2R / 2);
+  const yw = PANO.yaw * D2R, pt = PANO.pitch * D2R;
+  const fwd = [Math.cos(pt) * Math.sin(yw), Math.cos(pt) * Math.cos(yw), Math.sin(pt)];
+  const rgt = [Math.cos(yw), -Math.sin(yw), 0];
+  const up = [rgt[1]*fwd[2]-rgt[2]*fwd[1], rgt[2]*fwd[0]-rgt[0]*fwd[2], rgt[0]*fwd[1]-rgt[1]*fwd[0]];
+  let o = 0;
+  for (let y = 0; y < H; y++) {
+    const cy = -(y + 0.5 - H / 2) / f;
+    for (let x = 0; x < W; x++) {
+      const cx = (x + 0.5 - W / 2) / f;
+      const d0 = fwd[0] + cx*rgt[0] + cy*up[0], d1 = fwd[1] + cx*rgt[1] + cy*up[1], d2 = fwd[2] + cx*rgt[2] + cy*up[2];
+      const n = Math.hypot(d0, d1, d2);
+      const lon = Math.atan2(d0, d1), lat = Math.asin(d2 / n);
+      let px = ((lon / (2 * Math.PI) + 0.5) * pw) | 0, py = ((0.5 - lat / Math.PI) * ph) | 0;
+      if (px >= pw) px = pw - 1; if (py >= ph) py = ph - 1; if (py < 0) py = 0;
+      const k = (py * pw + px) * 4;
+      out.data[o++] = P[k]; out.data[o++] = P[k+1]; out.data[o++] = P[k+2]; out.data[o++] = 255;
+    }
+  }
+  ctx.putImageData(out, 0, 0);
+}
+(function viewerDrag() {
+  const cv = $('viewer'); let last = null, raf = 0;
+  cv.addEventListener('pointerdown', e => { last = [e.clientX, e.clientY]; cv.setPointerCapture(e.pointerId); });
+  cv.addEventListener('pointermove', e => {
+    if (!last || !PANO) return;
+    const k = PANO.fov / cv.clientHeight;
+    PANO.yaw -= (e.clientX - last[0]) * k; PANO.pitch = Math.max(-89, Math.min(89, PANO.pitch + (e.clientY - last[1]) * k));
+    last = [e.clientX, e.clientY];
+    if (!raf) raf = requestAnimationFrame(() => { raf = 0; drawViewer(); });
+  });
+  cv.addEventListener('pointerup', () => { last = null; });
+  cv.addEventListener('pointercancel', () => { last = null; });
+})();
+// JPEG + GPano XMP so Panoee / Facebook / Google Photos treat it as 360
+function addGPano(bytes, W, H) {
+  const xmp = `<x:xmpmeta xmlns:x="adobe:ns:meta/"><rdf:RDF xmlns:rdf="http://www.w3.org/1999/02/22-rdf-syntax-ns#"><rdf:Description rdf:about="" xmlns:GPano="http://ns.google.com/photos/1.0/panorama/" GPano:ProjectionType="equirectangular" GPano:UsePanoramaViewer="True" GPano:CroppedAreaImageWidthPixels="${W}" GPano:CroppedAreaImageHeightPixels="${H}" GPano:FullPanoWidthPixels="${W}" GPano:FullPanoHeightPixels="${H}" GPano:CroppedAreaLeftPixels="0" GPano:CroppedAreaTopPixels="0"/></rdf:RDF></x:xmpmeta>`;
+  const enc = new TextEncoder(), hdr = enc.encode('http://ns.adobe.com/xap/1.0/\0'), body = enc.encode(xmp);
+  const len = 2 + hdr.length + body.length, seg = new Uint8Array(2 + len);
+  seg[0] = 0xFF; seg[1] = 0xE1; seg[2] = len >> 8; seg[3] = len & 255; seg.set(hdr, 4); seg.set(body, 4 + hdr.length);
+  let pos = 2; // after SOI, skip APP0 (JFIF) if present
+  if (bytes[2] === 0xFF && bytes[3] === 0xE0) pos = 4 + ((bytes[4] << 8) | bytes[5]);
+  const out = new Uint8Array(bytes.length + seg.length);
+  out.set(bytes.subarray(0, pos), 0); out.set(seg, pos); out.set(bytes.subarray(pos), pos + seg.length);
+  return out;
+}
+async function panoFile() {
+  const blob = await new Promise(r => PANO.canvas.toBlob(r, 'image/jpeg', 0.9));
+  const bytes = addGPano(new Uint8Array(await blob.arrayBuffer()), PANO.W, PANO.H);
+  return new File([bytes], `${safeName($('inPoint').value)}_360.jpg`, { type: 'image/jpeg' });
+}
+async function downloadPano() {
+  if (!PANO) return;
+  const f = await panoFile(), url = URL.createObjectURL(f);
+  const a = document.createElement('a'); a.href = url; a.download = f.name; document.body.appendChild(a); a.click(); a.remove();
+  setTimeout(() => URL.revokeObjectURL(url), 30000);
+}
+async function sharePano() {
+  if (!PANO) return;
+  const f = await panoFile();
+  if (navigator.canShare && navigator.canShare({ files: [f] })) { try { await navigator.share({ files: [f], title: f.name }); } catch (e) {} }
+  else $('stitchInfo').textContent = 'Compartir no está disponible aquí; usa Descargar JPG 360.';
 }
 
 // ---------- UI wiring ----------
@@ -703,6 +1230,23 @@ $('btnZip').onclick = downloadZip;
 $('btnShare').onclick = shareZip;
 $('btnRetake').onclick = () => closeSheet('done');
 $('btnNext').onclick = nextPoint;
+$('btnStitch').onclick = startStitch;
+$('btnJpg').onclick = downloadPano;
+$('btnShareJpg').onclick = sharePano;
+$('chipAE').onclick = () => { buildCamPanel(); openSheet('camsheet'); };
+$('btnCamPanel').onclick = () => { closeSheet('settings'); buildCamPanel(); openSheet('camsheet'); };
+$('btnCloseCam').onclick = () => closeSheet('camsheet');
+$('btnCamReset').onclick = async () => {
+  cfg.cam = {}; saveCfg();
+  const caps = S.track && S.track.getCapabilities ? S.track.getCapabilities() : {}, obj = {};
+  for (const k of ['exposureMode', 'whiteBalanceMode', 'focusMode']) if (caps[k] && caps[k].includes('continuous')) obj[k] = 'continuous';
+  if ('exposureCompensation' in caps) obj.exposureCompensation = 0;
+  if (caps.zoom) obj.zoom = caps.zoom.min;
+  await applyCam(obj); S.aeLocked = false; updateAEChip(); buildCamPanel();
+};
+$('inRes').onchange = async e => { cfg.res = e.target.value; saveCfg(); await openCamera($('inCam').value || null); resetPoint(); buildCamPanel(); };
+$('inAutoLock').onchange = e => { cfg.autoLock = e.target.checked; saveCfg(); };
+$('inOutW').value = String(cfg.outW); $('inRefine').checked = cfg.refine;
 $('progress').onclick = () => { if (S.shots.length) showDone(); };
 $('inPoint').oninput = e => { $('pname').textContent = e.target.value; };
 $('inCam').onchange = async e => { try { localStorage.setItem('guia360cam', e.target.value); } catch (x) {} await openCamera(e.target.value); resetPoint(); };
