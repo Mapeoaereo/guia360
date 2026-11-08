@@ -126,9 +126,15 @@
   <div class="row"><label>Tolerancia de alineación: <b id="tolVal">3</b>°</label><input id="inTol" type="range" min="1" max="6" value="3"></div>
   <div class="row"><button id="btnCamPanel">📷 Controles de cámara (exposición, ISO, balance, enfoque)</button></div>
   <div class="row inline"><label>Disparo automático al alinear</label><input id="inAuto" type="checkbox" checked></div>
+  <div class="row"><label>Patrón de tomas</label>
+    <select id="inPattern">
+      <option value="tripod">Tripié: filas a ±40° + techo</option>
+      <option value="compact">Compacto: filas a ±70°</option>
+    </select>
+    <span class="note">El tripié inclina menos el cel: el piso y el techo salen más centrados y con menos paralaje, a cambio de ~3 tomas más.</span></div>
   <div class="row inline"><label>Incluir foto del piso (nadir)</label><input id="inNadir" type="checkbox"></div>
   <div class="row"><div id="plansum"></div></div>
-  <span class="note">Cambiar lente, campo de visión, traslape o nadir reinicia el punto actual.</span>
+  <span class="note">Cambiar lente, campo de visión, traslape, patrón o nadir reinicia el punto actual.</span>
   <div class="btns" style="margin-top:14px"><button id="btnCloseSettings" class="primary">Listo</button></div>
 </div>
 
@@ -556,7 +562,12 @@ function shortFov(longFov, w, h) {
   return 2 * Math.atan(Math.tan(longFov*D2R/2) * s / l) * R2D;
 }
 // Shot plan. H = horizontal FOV (portrait short side), V = vertical FOV (long side), ov = 0..1
-function planShots(H, V, ov, includeNadir) {
+// pattern 'tripod' (por defecto): filas suaves tipo DJI. La fila más inclinada apenas alcanza el polo con su orilla
+//   (pitch = 90 − V/2 + 5°), así el piso y el techo cercanos a las paredes caen al centro de las fotos y el lente
+//   se desplaza menos al inclinar (menos paralaje). Más 1 foto al techo (cenit). El nadir queda para el logo.
+// pattern 'compact': el plan original, con filas a ±V·(1−traslape) (±70° con gran angular), menos tomas pero más inclinadas.
+function planShots(H, V, ov, includeNadir, pattern) {
+  if (pattern !== 'compact') return planTripod(H, V, ov, includeNadir);
   const nFor = p => Math.max(4, Math.ceil(360 * Math.cos(p*D2R) / (H * (1 - ov))));
   const step = V * (1 - ov);
   const up = [{ pitch: 0, n: nFor(0) }];
@@ -577,6 +588,21 @@ function planShots(H, V, ov, includeNadir) {
   rows.forEach((row, ri) => {
     const off = (row.n > 1 && row.pitch !== 0) ? 180 / row.n : 0; // stagger rows to close corner gaps
     for (let k = 0; k < row.n; k++) targets.push({ yaw: wrap180(off + k * 360 / row.n), pitch: row.pitch, row: ri });
+  });
+  return { rows, targets };
+}
+function planTripod(H, V, ov, includeNadir) {
+  // Una sola fila inclinada arriba y otra abajo, a 90 − V/2 (±40° con gran angular): su orilla llega justo al polo.
+  // Si el lente es angosto y eso rompería el traslape con el horizonte, se limita a V·(1−traslape) (queda igual que 'compact').
+  // Verificado con tests/test_cobertura.js: gran angular 4:3 = 18 tomas, 100% cubierto, sin hueco en el nadir.
+  const p = Math.max(10, Math.min(90 - V / 2, V * (1 - ov)));
+  const nFor = q => Math.max(4, Math.ceil(360 * Math.cos(q * D2R) / (H * (1 - ov))));
+  const rows = [{ pitch: 0, n: nFor(0) }, { pitch: p, n: nFor(p) }, { pitch: 90, n: 1 }, { pitch: -p, n: nFor(p) }];
+  if (includeNadir) rows.push({ pitch: -90, n: 1 });
+  const targets = [];
+  rows.forEach((row, ri) => {
+    const off = (row.n > 1 && row.pitch !== 0) ? 180 / row.n : 0;
+    for (let k2 = 0; k2 < row.n; k2++) targets.push({ yaw: wrap180(off + k2 * 360 / row.n), pitch: row.pitch, row: ri });
   });
   return { rows, targets };
 }
@@ -646,7 +672,7 @@ const S = {
   busy: false, alignedSince: 0, alignedIdx: -1,
   calib: null, wakeLock: null, audio: null, aeLocked: false
 };
-const cfg = { longFov: 100, ov: 0.30, tol: 3, auto: true, nadir: false, lens: 'uw', res: 'max', autoLock: true, cam: {}, outW: 5760, refine: true };
+const cfg = { longFov: 100, ov: 0.30, tol: 3, auto: true, nadir: false, pattern: 'tripod', lens: 'uw', res: 'max', autoLock: true, cam: {}, outW: 5760, refine: true };
 try { Object.assign(cfg, JSON.parse(localStorage.getItem('guia360cfg') || '{}')); } catch (e) {}
 const saveCfg = () => { try { localStorage.setItem('guia360cfg', JSON.stringify(cfg)); } catch (e) {} };
 
@@ -670,7 +696,7 @@ function screenFocal() {
 
 function rebuildPlan() {
   const { H, V } = fovs();
-  S.plan = planShots(H, V, cfg.ov, cfg.nadir);
+  S.plan = planShots(H, V, cfg.ov, cfg.nadir, cfg.pattern);
   const rows = S.plan.rows.map(r => r.pitch === 90 ? 'techo 1' : r.pitch === -90 ? 'piso 1' : `${r.pitch > 0 ? '+' : ''}${Math.round(r.pitch)}°: ${r.n}`).join(' · ');
   $('plansum').innerHTML = `<b>${S.plan.targets.length} tomas por punto</b><br>Filas: ${rows}<br>Campo de visión: ${H.toFixed(0)}° × ${V.toFixed(0)}°`;
   updateProgress();
@@ -1347,12 +1373,13 @@ $('inOv').oninput = e => { cfg.ov = +e.target.value / 100; $('ovVal').textConten
 $('inTol').oninput = e => { cfg.tol = +e.target.value; $('tolVal').textContent = e.target.value; saveCfg(); };
 $('inAuto').onchange = e => { cfg.auto = e.target.checked; saveCfg(); };
 $('inNadir').onchange = e => { cfg.nadir = e.target.checked; saveCfg(); resetPoint(); };
+$('inPattern').onchange = e => { cfg.pattern = e.target.value; saveCfg(); resetPoint(); };
 
 // restore cfg into UI
 $('inLens').value = cfg.lens; $('inFov').value = cfg.longFov;
 $('inOv').value = Math.round(cfg.ov * 100); $('ovVal').textContent = Math.round(cfg.ov * 100);
 $('inTol').value = cfg.tol; $('tolVal').textContent = cfg.tol;
-$('inAuto').checked = cfg.auto; $('inNadir').checked = cfg.nadir;
+$('inAuto').checked = cfg.auto; $('inNadir').checked = cfg.nadir; $('inPattern').value = cfg.pattern === 'compact' ? 'compact' : 'tripod';
 window.addEventListener('beforeunload', e => { if (S.shots.length) { e.preventDefault(); e.returnValue = ''; } });
 </script>
 </body>
