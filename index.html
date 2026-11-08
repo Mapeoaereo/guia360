@@ -237,7 +237,100 @@
     for (let it = 0; it < 8; it++) { const r2 = x*x + y*y, f = 1 + K[0]*r2 + K[1]*r2*r2; x = xd / f; y = yd / f; }
     return [x, y];
   }
-  function camRay(x, y, w, h, F, K) { const [xu, yu] = undistortXY((x - w/2) / F, -(y - h/2) / F, K); return nz([xu, yu, 1]); }
+  // camRay: píxel → rayo de la cámara. Si la foto tiene malla, primero se corrige el punto (coordenadas normalizadas)
+  function camRay(x, y, w, h, F, K, mesh) {
+    let xd = (x - w/2) / F, yd = -(y - h/2) / F;
+    if (mesh) { const d = meshAt(mesh, xd, yd); xd += d[0]; yd += d[1]; }
+    const [xu, yu] = undistortXY(xd, yd, K); return nz([xu, yu, 1]);
+  }
+  // ---------- Malla flexible por foto ----------
+  // Rejilla de GX×GY nodos sobre la foto, en coordenadas normalizadas (tangente: independientes de la resolución).
+  // Cada nodo guarda un desplazamiento (dx, dy); entre nodos se interpola bilineal. Corrección: punto ideal = punto medido + D(punto).
+  function makeMesh(tx, ty, GX, GY) { return { GX, GY, x0: -tx, y0: -ty, cw: 2 * tx / (GX - 1), ch: 2 * ty / (GY - 1), d: new Float64Array(GX * GY * 2) }; }
+  function meshCell(M, x, y) {
+    let fx = (x - M.x0) / M.cw, fy = (y - M.y0) / M.ch;
+    fx = Math.max(0, Math.min(M.GX - 1.000001, fx)); fy = Math.max(0, Math.min(M.GY - 1.000001, fy));
+    const ix = fx | 0, iy = fy | 0, ax = fx - ix, ay = fy - iy, n00 = iy * M.GX + ix;
+    return [n00, n00 + 1, n00 + M.GX, n00 + M.GX + 1, (1-ax)*(1-ay), ax*(1-ay), (1-ax)*ay, ax*ay];
+  }
+  function meshAt(M, x, y) {
+    const c = meshCell(M, x, y), d = M.d; let dx = 0, dy = 0;
+    for (let k = 0; k < 4; k++) { dx += d[2*c[k]] * c[4+k]; dy += d[2*c[k]+1] * c[4+k]; }
+    return [dx, dy];
+  }
+  // Inversa (para el render): dado el punto ideal q, el punto medido p cumple p + D(p) = q
+  function meshInv(M, qx, qy, iters) { let px = qx, py = qy; for (let it = 0; it < (iters || 1); it++) { const d = meshAt(M, px, py); px = qx - d[0]; py = qy - d[1]; } return [px, py]; }
+
+  // Resuelve las mallas de todas las fotos a la vez: mínimos cuadrados con (1) puntos en común que coincidan,
+  // (2) suavidad entre nodos vecinos y (3) un ancla débil hacia cero. Gradiente conjugado sin armar la matriz.
+  function meshWarp(job, feats, imgs, matches, s, K) {
+    const n = imgs.length, GX = job.meshGX || 8, GY = job.meshGY || 10;
+    const meshes = feats.map(f => makeMesh(f.gw / 2 / (f.F * s), f.gh / 2 / (f.F * s), GX, GY));
+    const NP = GX * GY * 2, N = n * NP;
+    const wM = 1 / (0.002 * 0.002), huber = 0.003;
+    const wS = 1 / Math.pow(job.meshSmooth || 0.012, 2), w0 = 1 / Math.pow(job.meshAnchor || 0.01, 2);
+    const ray = (m, side, dxn, dyn) => {
+      const i = side ? m.j : m.i, f = feats[i], px = side ? m.bx : m.ax, py = side ? m.by : m.ay, F = f.F * s;
+      let xd = (px - f.gw/2) / F + dxn, yd = -(py - f.gh/2) / F + dyn;
+      const d0 = meshAt(meshes[i], xd - dxn, yd - dyn); xd += d0[0]; yd += d0[1];
+      const [xu, yu] = undistortXY(xd, yd, K); return toWorld(imgs[i], nz([xu, yu, 1]));
+    };
+    let stats = null;
+    for (let outer = 0; outer < (job.meshOuter || 2); outer++) {
+      // Linealiza cada coincidencia: e(X) ≈ e0 + Σ c_p X_p
+      const rows = [];
+      for (const m of matches) {
+        if (imgs[m.i].skip || imgs[m.j].skip) continue;
+        const wa = ray(m, 0, 0, 0), wb = ray(m, 1, 0, 0), e0 = [wa[0]-wb[0], wa[1]-wb[1], wa[2]-wb[2]], h = 1e-4;
+        const ax = ray(m, 0, h, 0), ay = ray(m, 0, 0, h), bx = ray(m, 1, h, 0), by = ray(m, 1, 0, h);
+        const dax = [(ax[0]-wa[0])/h, (ax[1]-wa[1])/h, (ax[2]-wa[2])/h], day = [(ay[0]-wa[0])/h, (ay[1]-wa[1])/h, (ay[2]-wa[2])/h];
+        const dbx = [-(bx[0]-wb[0])/h, -(bx[1]-wb[1])/h, -(bx[2]-wb[2])/h], dby = [-(by[0]-wb[0])/h, -(by[1]-wb[1])/h, -(by[2]-wb[2])/h];
+        const cols = [];
+        const add = (i, side) => {
+          const f = feats[i], F = f.F * s, px = side ? m.bx : m.ax, py = side ? m.by : m.ay;
+          const c = meshCell(meshes[i], (px - f.gw/2) / F, -(py - f.gh/2) / F), base = i * NP, gx = side ? dbx : dax, gy = side ? dby : day;
+          for (let k = 0; k < 4; k++) { const wgt = c[4+k]; if (wgt < 1e-6) continue;
+            cols.push(base + 2*c[k], [gx[0]*wgt, gx[1]*wgt, gx[2]*wgt], base + 2*c[k] + 1, [gy[0]*wgt, gy[1]*wgt, gy[2]*wgt]); }
+        };
+        add(m.i, 0); add(m.j, 1);
+        const en = norm(e0); rows.push({ e0, cols, w: wM * (en > huber ? huber / en : 1) });
+      }
+      // X = corrección incremental sobre las mallas actuales
+      const cur = new Float64Array(N); for (let i = 0; i < n; i++) cur.set(meshes[i].d, i * NP);
+      const Hv = (v, out) => {
+        out.fill(0);
+        for (const r of rows) {
+          const c = r.cols; let t0 = 0, t1 = 0, t2 = 0;
+          for (let k = 0; k < c.length; k += 2) { const vv = v[c[k]], g = c[k+1]; t0 += g[0]*vv; t1 += g[1]*vv; t2 += g[2]*vv; }
+          for (let k = 0; k < c.length; k += 2) { const g = c[k+1]; out[c[k]] += r.w * (g[0]*t0 + g[1]*t1 + g[2]*t2); }
+        }
+        for (let i = 0; i < n; i++) { const b = i * NP;
+          for (let y = 0; y < GY; y++) for (let x = 0; x < GX; x++) { const a = b + 2*(y*GX + x);
+            for (const nb of [x + 1 < GX ? a + 2 : -1, y + 1 < GY ? a + 2*GX : -1]) if (nb >= 0) for (let q = 0; q < 2; q++) {
+              const dlt = wS * (v[a+q] - v[nb+q]); out[a+q] += dlt; out[nb+q] -= dlt; } } }
+        for (let k = 0; k < N; k++) out[k] += w0 * v[k];
+      };
+      // lado derecho: −(Jᵀ W e0) − (suavidad y ancla aplicadas a la malla actual)
+      const g = new Float64Array(N);
+      for (const r of rows) { const c = r.cols; for (let k = 0; k < c.length; k += 2) { const gg = c[k+1]; g[c[k]] -= r.w * (gg[0]*r.e0[0] + gg[1]*r.e0[1] + gg[2]*r.e0[2]); } }
+      { const tmp = new Float64Array(N), rowsSave = rows.splice(0); Hv(cur, tmp); rows.push(...rowsSave); for (let k = 0; k < N; k++) g[k] -= tmp[k]; }
+      // gradiente conjugado
+      const x = new Float64Array(N), r = Float64Array.from(g), p = Float64Array.from(g), Ap = new Float64Array(N);
+      let rr = r.reduce((a, v) => a + v*v, 0); const rr0 = rr;
+      let it = 0;
+      for (; it < 300 && rr > rr0 * 1e-10; it++) {
+        Hv(p, Ap); let pAp = 0; for (let k = 0; k < N; k++) pAp += p[k]*Ap[k];
+        const al = rr / pAp; let rr2 = 0;
+        for (let k = 0; k < N; k++) { x[k] += al * p[k]; r[k] -= al * Ap[k]; rr2 += r[k]*r[k]; }
+        const be = rr2 / rr; rr = rr2; for (let k = 0; k < N; k++) p[k] = r[k] + be * p[k];
+      }
+      for (let i = 0; i < n; i++) for (let k = 0; k < NP; k++) meshes[i].d[k] += x[i * NP + k];
+      let mx = 0; for (const M of meshes) for (const v of M.d) mx = Math.max(mx, Math.abs(v));
+      stats = { iters: it, maxDeg: +(Math.atan(mx) * R2D).toFixed(3), rows: rows.length };
+    }
+    for (let i = 0; i < n; i++) { feats[i].mesh = meshes[i]; imgs[i].mesh = meshes[i]; }
+    return stats;
+  }
   function toWorld(P, c) { return [c[0]*P.r[0] + c[1]*P.u[0] + c[2]*P.f[0], c[0]*P.r[1] + c[1]*P.u[1] + c[2]*P.f[1], c[0]*P.r[2] + c[1]*P.u[2] + c[2]*P.f[2]]; }
   function solve(A, b) { // Gaussian elimination with partial pivoting; A is array of rows (modified)
     const n = b.length;
@@ -315,6 +408,9 @@
       if (pi % 8 === 0) progress('Emparejando fotos', 0.4 + pi / totalPairs * 0.3);
     }
     bf.delete(); feats.forEach(f => f.des.delete());
+    // Solo para pruebas: aparta 1 de cada 5 puntos para medir sin que el ajuste los vea
+    let held = [];
+    if (job.holdout) { held = matches.filter((m, k) => k % 5 === 0); for (let k = matches.length - 1; k >= 0; k--) if (k % 5 === 0) matches.splice(k, 1); }
     if (matches.length < 20) return { ok: false, reason: 'pocos puntos en común', matches: matches.length };
 
     // Gauss-Newton with Huber, gyro prior, image 0 fixed
@@ -322,13 +418,16 @@
     const useK = job.distortion !== false;
     const P = 3 * (n - 1) + 3, FI = P - 3, K1I = P - 2, K2I = P - 1;
     const acc = imgs.map(() => [0, 0, 0]);
+    // Gravedad medida por el giroscopio en el marco de cada foto (componentes de "arriba" en r, u, f). Es confiable aunque el rumbo no.
+    const grav = imgs.map(im => [im.r[2], im.u[2], im.f[2]]);
     let s = 1, K = [0, 0];
-    const wM = 1 / (0.002 * 0.002), wPrior = 1 / (0.04 * 0.04), wF = 1 / (0.08 * 0.08), huber = 0.003;
+    const wM = 1 / (0.002 * 0.002), wF = 1 / (0.08 * 0.08), huber = 0.003;
+    const wTilt = 1 / Math.pow((job.tiltSigmaDeg || 0.5) * D2R, 2), wHead = 1 / Math.pow((job.headSigmaDeg || 5) * D2R, 2);
     const wK1 = useK ? 1 / (0.05 * 0.05) : 1e12, wK2 = useK ? 1 / (0.02 * 0.02) : 1e12;
     let active = matches;
     const resid = (m, sc, Kx) => {
       const A = feats[m.i], B = feats[m.j];
-      const ca = camRay(m.ax, m.ay, A.gw, A.gh, A.F * sc, Kx), cb = camRay(m.bx, m.by, B.gw, B.gh, B.F * sc, Kx);
+      const ca = camRay(m.ax, m.ay, A.gw, A.gh, A.F * sc, Kx, A.mesh), cb = camRay(m.bx, m.by, B.gw, B.gh, B.F * sc, Kx, B.mesh);
       const wa = toWorld(imgs[m.i], ca), wb = toWorld(imgs[m.j], cb);
       return { wa, wb, e: [wa[0]-wb[0], wa[1]-wb[1], wa[2]-wb[2]] };
     };
@@ -354,7 +453,11 @@
         cols.push({ idx: FI, c: de }, { idx: K1I, c: dk1 }, { idx: K2I, c: dk2 });
         for (const p of cols) { b[p.idx] += w * dot(p.c, e); for (const q of cols) A[p.idx][q.idx] += w * dot(p.c, q.c); }
       }
-      for (let i = 1; i < n; i++) for (let k = 0; k < 3; k++) { const o = 3 * (i - 1) + k, wp = nearPole[i] && k === 2 ? wPrior * 0.01 : wPrior; A[o][o] += wp; b[o] += wp * acc[i][k]; }
+      // Prior del giroscopio por eje del mundo: la inclinación (giros sobre ejes horizontales x, y) la mide bien la gravedad;
+      // el rumbo (giro sobre el eje vertical z) no. Sin esta separación la esfera quedaba deformada (horizonte de −3° a +13°).
+      for (let i = 1; i < n; i++) for (let k = 0; k < 3; k++) {
+        const o = 3 * (i - 1) + k, wp = k === 2 ? (nearPole[i] ? wHead * 0.01 : wHead) : wTilt;
+        A[o][o] += wp; b[o] += wp * acc[i][k]; }
       A[FI][FI] += wF; b[FI] += wF * (s - 1);
       A[K1I][K1I] += wK1; b[K1I] += wK1 * K[0]; A[K2I][K2I] += wK2; b[K2I] += wK2 * K[1];
       for (let k = 0; k < P; k++) A[k][k] *= 1.0001;
@@ -368,13 +471,47 @@
       if (useK) K = [Math.max(-0.3, Math.min(0.3, K[0] + dx[K1I])), Math.max(-0.15, Math.min(0.15, K[1] + dx[K2I]))];
       progress('Alineando', 0.7 + (it + 1) / 14 * 0.3);
     }
+    // Nivelar: la alineación solo cuida que las fotos coincidan entre sí; la orientación del conjunto quedaba amarrada a la foto 0
+    // y podía ladearse varios grados (fotos reales: horizonte entre −3° y +13°). Se gira toda la esfera para que su "arriba"
+    // coincida con la gravedad promedio de todas las fotos: z' = promedio de C_i·g_i (robusto: se descartan las que discrepan).
+    const level = levelToGravity(imgs, grav, job.level !== false);
     // Fotos del cenit/nadir que quedaron con poco apoyo: alinearlas mal duplica objetos (p. ej. la lámpara); mejor no usarlas
     const support = new Array(n).fill(0); for (const m of active) { support[m.i]++; support[m.j]++; }
     const dropped = [];
     for (let i = 1; i < n; i++) if (nearPole[i] && support[i] < (job.minPoleSupport ?? 15)) { imgs[i].skip = true; dropped.push(i); }
-    const out = { ok: true, matches: matches.length, used: active.length, pairs: pairCount, errBeforeDeg: before, errAfterDeg: errDeg(active), focalScale: s, k: K, support, dropped };
+    const out = { ok: true, matches: matches.length, used: active.length, pairs: pairCount, errBeforeDeg: before, errAfterDeg: errDeg(active), focalScale: s, k: K, support, dropped, level };
+    // Ajuste fino local (malla flexible por foto) para absorber el paralaje que un giro rígido no puede corregir
+    const evalHeld = () => held.length ? median(held.map(m => norm(resid(m, s, K).e))) * R2D : null;
+    if (held.length) out.heldBeforeDeg = evalHeld();
+    if (job.mesh !== false) {
+      progress('Ajuste fino', 0.97);
+      const mres = meshWarp(job, feats, imgs, active, s, K);
+      out.mesh = mres;
+      out.errMeshDeg = errDeg(active);
+      if (held.length) out.heldAfterDeg = evalHeld();
+    }
     if (job.diag) out.diag = { matches: active, F: feats.map(f => f.F * s), gw: feats.map(f => f.gw), gh: feats.map(f => f.gh) }; // solo para pruebas
     return out;
+  }
+
+  // Gira todas las fotos para que el "arriba" de la esfera coincida con la gravedad medida en cada foto
+  function levelToGravity(imgs, grav, apply) {
+    const up = C => { const z = [0, 0, 0]; return z; };
+    const estimate = use => { const z = [0, 0, 0];
+      imgs.forEach((im, i) => { if (!use[i]) return; const g = grav[i]; for (let k = 0; k < 3; k++) z[k] += im.r[k]*g[0] + im.u[k]*g[1] + im.f[k]*g[2]; });
+      return nz(z); };
+    const devDeg = (z, i) => { const im = imgs[i], g = grav[i]; return Math.acos(clamp1(im.r[0]*0 + (z[0]*im.r[0] + z[1]*im.r[1] + z[2]*im.r[2]) * g[0] + (z[0]*im.u[0] + z[1]*im.u[1] + z[2]*im.u[2]) * g[1] + (z[0]*im.f[0] + z[1]*im.f[1] + z[2]*im.f[2]) * g[2])) * R2D; };
+    let use = imgs.map(im => !im.skip), z = estimate(use);
+    // descarta fotos que discrepan mucho del consenso (giroscopio movido en esa toma) y recalcula
+    const d0 = imgs.map((_, i) => devDeg(z, i)), med = median(d0.filter((_, i) => use[i]));
+    use = use.map((u, i) => u && d0[i] <= Math.max(3, 3 * med)); z = estimate(use);
+    const tilt = Math.acos(clamp1(z[2])) * R2D;
+    if (apply && tilt > 0.05) {
+      const ax = nz(cross(z, [0, 0, 1])), v = ax.map(a => a * Math.acos(clamp1(z[2])));
+      for (const im of imgs) { im.r = rotVec(v, im.r); im.u = rotVec(v, im.u); im.f = rotVec(v, im.f); orthonorm(im); }
+    }
+    const after = imgs.map((_, i) => devDeg([0, 0, 1], i)).filter((_, i) => use[i]);
+    return { tiltDeg: +tilt.toFixed(2), applied: !!apply, medianDevDeg: +median(after).toFixed(2), maxDevDeg: +Math.max(...after).toFixed(2), used: use.filter(Boolean).length };
   }
 
   // ---------- 2) Photometric model: per-image gain + shared vignetting, solved jointly ----------
@@ -426,7 +563,8 @@
   }
   function lumAt(img, d, F, K) {
     const fz = dot(img.f, d); if (fz <= 0) return null;
-    const [qx, qy] = distortXY(dot(img.r, d) / fz, dot(img.u, d) / fz, K);
+    let [qx, qy] = distortXY(dot(img.r, d) / fz, dot(img.u, d) / fz, K);
+    if (img.mesh) [qx, qy] = meshInv(img.mesh, qx, qy);
     const px = img.w / 2 + qx * F, py = img.h / 2 - qy * F;
     if (px < 2 || py < 2 || px > img.w - 3 || py > img.h - 3) return null;
     const k = ((py | 0) * img.w + (px | 0)) * 4, D = img.rgba;
@@ -451,6 +589,153 @@
     return { lw, lh, d: src };
   }
 
+  // ---------- 3b) Costuras inteligentes (graph cut, alfa-expansión) ----------
+  // En una rejilla equirectangular gruesa (0.5°) se elige qué foto usar en cada celda minimizando:
+  //   Σ costo de datos (preferir la foto que ve la celda más al centro)
+  // + Σ costo de costura entre celdas vecinas con foto distinta (cuánto difieren las dos fotos ahí + una constante).
+  // Así la unión pasa por donde las fotos coinciden (centro liso de un azulejo, pared) y no corta juntas o esquinas que no cuadran.
+  // Resultado: una máscara suave por foto que el render usa como peso de la banda de detalle.
+  function maxflowDinic(N, s, t, E) {
+    // E = { head, next, to, cap, cnt } (aristas en pares: e y e^1)
+    const level = new Int32Array(N), it = new Int32Array(N), q = new Int32Array(N);
+    const { head, next, to, cap } = E; let flow = 0;
+    const bfs = () => {
+      level.fill(-1); let qh = 0, qt = 0; q[qt++] = s; level[s] = 0;
+      while (qh < qt) { const u = q[qh++]; for (let e = head[u]; e >= 0; e = next[e]) if (cap[e] > 1e-9 && level[to[e]] < 0) { level[to[e]] = level[u] + 1; q[qt++] = to[e]; } }
+      return level[t] >= 0;
+    };
+    const stackN = new Int32Array(N), stackE = new Int32Array(N);
+    while (bfs()) {
+      for (let u = 0; u < N; u++) it[u] = head[u];
+      // DFS iterativo con aristas actuales (current arc)
+      while (true) {
+        let sp = 0, u = s, found = false;
+        while (true) {
+          if (u === t) { found = true; break; }
+          let e = it[u];
+          while (e >= 0 && !(cap[e] > 1e-9 && level[to[e]] === level[u] + 1)) e = next[e];
+          it[u] = e;
+          if (e < 0) { // callejón sin salida: retroceder
+            level[u] = -1; if (sp === 0) break; sp--; u = stackN[sp]; it[u] = next[it[u]]; continue;
+          }
+          stackN[sp] = u; stackE[sp] = e; sp++; u = to[e];
+        }
+        if (!found) break;
+        let f = Infinity; for (let k = 0; k < sp; k++) f = Math.min(f, cap[stackE[k]]);
+        for (let k = 0; k < sp; k++) { cap[stackE[k]] -= f; cap[stackE[k] ^ 1] += f; }
+        flow += f;
+      }
+    }
+    // lado de la fuente: alcanzable en el residual
+    const S = new Uint8Array(N); let qh = 0, qt = 0; q[qt++] = s; S[s] = 1;
+    while (qh < qt) { const u = q[qh++]; for (let e = head[u]; e >= 0; e = next[e]) if (cap[e] > 1e-9 && !S[to[e]]) { S[to[e]] = 1; q[qt++] = to[e]; } }
+    return { flow, S };
+  }
+
+  function computeSeams(job, F, phot, progress) {
+    const imgs = job.images, n = imgs.length, GW = job.seamGW || 720, GH = GW / 2, NC = GW * GH, MAXC = 6;
+    const K = job.K, useK = !!(K && (K[0] || K[1])), gain = phot.gain, c1 = phot.vig[0], c2 = phot.vig[1], useVig = c1 !== 0 || c2 !== 0;
+    const T0 = Date.now();
+    const cnt = new Uint8Array(NC), cI = new Int16Array(NC * MAXC), cE = new Float32Array(NC * MAXC), cC = new Float32Array(NC * MAXC * 3);
+    // 1) muestrear cada celda en cada foto que la ve
+    for (let y = 0; y < GH; y++) {
+      const p = (90 - (y + 0.5) / GH * 180) * D2R, cpz = Math.cos(p), sp = Math.sin(p);
+      for (let x = 0; x < GW; x++) {
+        const yw = ((x + 0.5) / GW * 360 - 180) * D2R, d0 = cpz * Math.sin(yw), d1 = cpz * Math.cos(yw), d2 = sp, c = y * GW + x;
+        for (let i = 0; i < n && cnt[c] < MAXC; i++) {
+          const im = imgs[i]; if (im.skip) continue;
+          const fz = im.f[0]*d0 + im.f[1]*d1 + im.f[2]*d2; if (fz <= 0.05) continue;
+          let qx = (im.r[0]*d0 + im.r[1]*d1 + im.r[2]*d2) / fz, qy = (im.u[0]*d0 + im.u[1]*d1 + im.u[2]*d2) / fz;
+          if (useK) { const r2 = qx*qx + qy*qy, fk = 1 + K[0]*r2 + K[1]*r2*r2; qx *= fk; qy *= fk; }
+          if (im.mesh) { const pm = meshInv(im.mesh, qx, qy); qx = pm[0]; qy = pm[1]; }
+          const px = im.w / 2 + qx * F[i] - 0.5, py = im.h / 2 - qy * F[i] - 0.5;
+          if (px < 1 || py < 1 || px > im.w - 3 || py > im.h - 3) continue;
+          const e = Math.min(px + 0.5, im.w - 1.5 - px, py + 0.5, im.h - 1.5 - py) / (0.5 * Math.min(im.w, im.h));
+          let k = gain[i];
+          if (useVig) { const dx = px + 0.5 - im.w / 2, dy = py + 0.5 - im.h / 2, r2 = (dx*dx + dy*dy) / ((im.w/2)**2 + (im.h/2)**2); k *= Math.exp(-(c1*r2 + c2*r2*r2)); }
+          // color promedio 3×3 (la celda mide ~0.5°, la foto tiene más detalle): reduce ruido en el costo
+          const x0 = px | 0, y0 = py | 0, D = im.rgba; let R = 0, G = 0, B = 0;
+          for (let oy = -1; oy <= 1; oy++) for (let ox = -1; ox <= 1; ox++) { const o = ((y0 + oy) * im.w + x0 + ox) * 4; R += D[o]; G += D[o+1]; B += D[o+2]; }
+          const s = c * MAXC + cnt[c]; cI[s] = i; cE[s] = e; cC[s*3] = R * k / 9; cC[s*3+1] = G * k / 9; cC[s*3+2] = B * k / 9; cnt[c]++;
+        }
+      }
+    }
+    const slot = (c, l) => { for (let k = 0; k < cnt[c]; k++) if (cI[c * MAXC + k] === l) return c * MAXC + k; return -1; };
+    const lam = job.seamData || 25, kap = job.seamConst || 1.5, BIG = 1e4;
+    const Dc = (c, l) => { const s = slot(c, l); if (s < 0) return BIG; const e = cE[s]; return lam * (1 - e) + (e < 0.04 ? 200 : 0); };
+    // costo de costura entre celdas c y d con fotos a y b
+    const diff = (c, a, b) => { const sa = slot(c, a), sb = slot(c, b); if (sa < 0 || sb < 0) return BIG / 4;
+      return (Math.abs(cC[sa*3] - cC[sb*3]) + Math.abs(cC[sa*3+1] - cC[sb*3+1]) + Math.abs(cC[sa*3+2] - cC[sb*3+2])) / 3; };
+    const V = (c, d, a, b) => a === b ? 0 : diff(c, a, b) + diff(d, a, b) + kap;
+    // 2) etiquetas iniciales: la foto más centrada (lo que se hacía antes)
+    const lab = new Int16Array(NC).fill(-1);
+    for (let c = 0; c < NC; c++) { let best = -1, be = -1; for (let k = 0; k < cnt[c]; k++) if (cE[c*MAXC+k] > be) { be = cE[c*MAXC+k]; best = cI[c*MAXC+k]; } lab[c] = best; }
+    const nbrs = c => { const x = c % GW, y = (c / GW) | 0, out = [y * GW + (x + 1) % GW]; if (y + 1 < GH) out.push(c + GW); return out; }; // derecha (envuelve) y abajo
+    const energy = () => { let E = 0; for (let c = 0; c < NC; c++) { if (lab[c] < 0) continue; E += Dc(c, lab[c]); for (const d of nbrs(c)) if (lab[d] >= 0) E += V(c, d, lab[c], lab[d]); } return E; };
+    const seamCost = () => { let s = 0, m = 0; for (let c = 0; c < NC; c++) { if (lab[c] < 0) continue; for (const d of nbrs(c)) if (lab[d] >= 0 && lab[d] !== lab[c]) { s += (diff(c, lab[c], lab[d]) + diff(d, lab[c], lab[d])) / 2; m++; } } return m ? s / m : 0; };
+    const T1 = Date.now();
+    const stats = { seamCostBefore: +seamCost().toFixed(2) };
+    let Ecur = energy(); const E0 = Ecur;
+    const id = new Int32Array(NC);
+    for (let cycle = 0; cycle < (job.seamCycles || 1); cycle++) {
+      for (let a = 0; a < n; a++) {
+        if (imgs[a].skip) continue;
+        // nodos: celdas donde la foto a es candidata y hoy tienen otra etiqueta
+        id.fill(-1); let N = 0; const nodes = [];
+        for (let c = 0; c < NC; c++) if (lab[c] >= 0 && lab[c] !== a && cnt[c] > 1 && slot(c, a) >= 0) { id[c] = N++; nodes.push(c); }
+        if (!N) continue;
+        const NN = N + 2, s = N, t = N + 1, maxE = (N * 2 + N * 4) * 2 + 16;
+        const E = { head: new Int32Array(NN).fill(-1), next: new Int32Array(maxE), to: new Int32Array(maxE), cap: new Float64Array(maxE), cnt: 0 };
+        const add = (u, v, c, rc) => { let e = E.cnt; E.to[e] = v; E.cap[e] = c; E.next[e] = E.head[u]; E.head[u] = e; e++; E.to[e] = u; E.cap[e] = rc; E.next[e] = E.head[v]; E.head[v] = e; E.cnt += 2; };
+        const u0 = new Float64Array(N), u1 = new Float64Array(N); // costo si conserva (0) o cambia a 'a' (1)
+        for (let k = 0; k < N; k++) { const c = nodes[k]; u0[k] += Dc(c, lab[c]); u1[k] += Dc(c, a); }
+        for (let k = 0; k < N; k++) {
+          const c = nodes[k], lp = lab[c];
+          for (const d of [c - 1 >= 0 && (c % GW) ? c - 1 : c + GW - 1, ...nbrs(c), c - GW >= 0 ? c - GW : -1]) {
+            if (d < 0 || lab[d] < 0) continue;
+            const kd = id[d];
+            if (kd >= 0) { if (kd < k) continue; // par de nodos: se agrega una sola vez
+              const lq = lab[d], A = V(c, d, lp, lq), B = V(c, d, lp, a), C = V(c, d, a, lq), Dd = 0;
+              u1[k] += C - A; u1[kd] += Dd - C;
+              const w = Math.max(0, B + C - A - Dd); if (w > 0) add(k, kd, w, 0);
+            } else { // vecino fijo con su etiqueta actual
+              u0[k] += V(c, d, lp, lab[d]); u1[k] += V(c, d, a, lab[d]);
+            }
+          }
+        }
+        for (let k = 0; k < N; k++) { const m = Math.min(u0[k], u1[k]); const a0 = u0[k] - m, a1 = u1[k] - m; if (a1 > 0) add(s, k, a1, 0); if (a0 > 0) add(k, t, a0, 0); }
+        const { S } = maxflowDinic(NN, s, t, E);
+        const old = []; for (let k = 0; k < N; k++) if (!S[k]) old.push([nodes[k], lab[nodes[k]]]);
+        if (old.length) {
+          // energía solo de lo que cambia: costo de datos de esas celdas y costuras que las tocan (cada par una vez)
+          const inSet = new Set(old.map(o => o[0]));
+          const local = () => { let E = 0; for (const c of inSet) { E += Dc(c, lab[c]);
+            const x = c % GW, y = (c / GW) | 0, nb = [y * GW + (x + 1) % GW, y * GW + (x + GW - 1) % GW, y + 1 < GH ? c + GW : -1, y > 0 ? c - GW : -1];
+            for (const d of nb) { if (d < 0 || lab[d] < 0) continue; if (inSet.has(d) && d < c) continue; E += V(c, d, lab[c], lab[d]); } } return E; };
+          const before = local(); for (const [c] of old) lab[c] = a; const after = local();
+          if (after > before + 1e-6) { for (const [c, l] of old) lab[c] = l; } else Ecur += after - before;
+        }
+      }
+      progress('Buscando costuras', (cycle + 1) / (job.seamCycles || 1));
+    }
+    const T2 = Date.now();
+    stats.seamCostAfter = +seamCost().toFixed(2); stats.energyDrop = +((1 - Ecur / E0) * 100).toFixed(1);
+    // 3) máscaras suaves por foto (caja 3×3 dos veces, con vuelta en longitud)
+    const masks = new Array(n).fill(null);
+    for (let i = 0; i < n; i++) {
+      let m = new Float32Array(NC), any = false; for (let c = 0; c < NC; c++) if (lab[c] === i) { m[c] = 1; any = true; }
+      if (!any) continue;
+      const tmp = new Float32Array(NC);
+      for (let pass = 0; pass < 2; pass++) {
+        for (let y = 0; y < GH; y++) for (let x = 0; x < GW; x++) tmp[y*GW + x] = (m[y*GW + (x + GW - 1) % GW] + m[y*GW + x] + m[y*GW + (x + 1) % GW]) / 3;
+        for (let y = 0; y < GH; y++) for (let x = 0; x < GW; x++) m[y*GW + x] = (tmp[Math.max(0, y - 1)*GW + x] + tmp[y*GW + x] + tmp[Math.min(GH - 1, y + 1)*GW + x]) / 3;
+      }
+      masks[i] = m;
+    }
+    stats.ms = { muestreo: T1 - T0, cortes: T2 - T1, mascaras: Date.now() - T2 };
+    return { GW, GH, masks, stats };
+  }
+
   // ---------- 3) Equirectangular render ----------
   // blend: 'twoband' (por defecto) = tonos con fundido amplio (banda baja a 1/16) + detalle por costura. En la escena sintética
   //          no se notaba, pero con fotos reales del iPhone (exposición distinta por foto y tono local tipo Smart HDR) quita
@@ -462,12 +747,14 @@
     const gain = phot.gain, c1 = phot.vig[0], c2 = phot.vig[1], useVig = c1 !== 0 || c2 !== 0;
     const K = job.K, useK = !!(K && (K[0] || K[1]));
     // ángulo de la esquina de cada foto (con distorsión, se calcula deshaciendo la distorsión de la esquina)
-    const diag = imgs.map((im, i) => { const [cx, cy] = undistortXY(im.w / 2 / F[i], im.h / 2 / F[i], K); return Math.atan(Math.hypot(cx, cy)) + 0.01; });
+    const diag = imgs.map((im, i) => { const [cx, cy] = undistortXY(im.w / 2 / F[i], im.h / 2 / F[i], K); return Math.atan(Math.hypot(cx, cy)) + 0.03; });
     const BS = 32, blockRad = Math.hypot(BS, BS) * (360 / W) * D2R;
     const holes = [40, 40, 44];
     const mode = job.blend || 'twoband', seam = mode !== 'feather', two = mode === 'twoband', tau = job.seamWidth || 0.03;
     LOWK = job.lowK || 16;
     const low = two ? imgs.map(makeLow) : null;
+    const SM = job.seams !== false && seam ? computeSeams(job, F, phot, progress) : null;
+    if (SM) job._seamStats = SM.stats;
     // Altas luces: al aclarar una foto (ganancia > 1) los tonos se acercan al blanco suavemente en vez de recortarse en 255
     const knee = job.knee === false ? 1e9 : 205, room = 255 - 205;
     const soft = v => v <= knee ? v : knee + room * (1 - Math.exp(-(v - knee) / room));
@@ -492,13 +779,18 @@
               const fz = im.f[0]*d0 + im.f[1]*d1 + im.f[2]*d2; if (fz <= 0.05) continue;
               let qx = (im.r[0]*d0 + im.r[1]*d1 + im.r[2]*d2) / fz, qy = (im.u[0]*d0 + im.u[1]*d1 + im.u[2]*d2) / fz;
               if (useK) { const r2 = qx*qx + qy*qy, fk = 1 + K[0]*r2 + K[1]*r2*r2; qx *= fk; qy *= fk; }
+              if (im.mesh) { const pm = meshInv(im.mesh, qx, qy); qx = pm[0]; qy = pm[1]; }
               const px = im.w / 2 + qx * F[i] - 0.5, py = im.h / 2 - qy * F[i] - 0.5;
               if (px < 0 || py < 0 || px > im.w - 2 || py > im.h - 2) continue;
               const e = Math.min(px + 0.5, im.w - 1.5 - px, py + 0.5, im.h - 1.5 - py) / (0.5 * Math.min(im.w, im.h));
               cpx[c] = px; cpy[c] = py; ce[c] = e; if (e > emax) emax = e;
             }
             // 2ª pasada: acumular. Banda baja (lo): fundido amplio e³. Banda alta (hi) o imagen completa: costura.
-            let lR = 0, lG = 0, lB = 0, lW = 0, hR = 0, hG = 0, hB = 0, hW = 0;
+            let lR = 0, lG = 0, lB = 0, lW = 0, hR = 0, hG = 0, hB = 0, hW = 0, mR = 0, mG = 0, mB = 0, mW = 0;
+            let sq = null;
+            if (SM) { let gx = (x + 0.5) / W * SM.GW - 0.5, gy = Math.max(0, Math.min(SM.GH - 1.001, (y + 0.5) / H * SM.GH - 0.5));
+              if (gx < 0) gx += SM.GW; const ix = gx | 0, iy = gy | 0, ax = gx - ix, ay = gy - iy, ix1 = (ix + 1) % SM.GW;
+              sq = [iy * SM.GW + ix, iy * SM.GW + ix1, (iy + 1) * SM.GW + ix, (iy + 1) * SM.GW + ix1, (1-ax)*(1-ay), ax*(1-ay), (1-ax)*ay, ax*ay]; }
             for (let c = 0; c < nc; c++) {
               const e = ce[c]; if (e < 0) continue;
               const i = cand[c], im = imgs[i], px = cpx[c], py = cpy[c];
@@ -506,7 +798,9 @@
               let ws = 0;
               if (seam) { ws = Math.exp((e - emax) / tau); if (ws < 2e-3) ws = 0; else ws *= Math.min(1, e * 20) + 1e-6; }
               else ws = wf;
-              if (!two && ws === 0) continue;
+              let wm = 0;
+              if (sq) { const Mi = SM.masks[i]; if (Mi) wm = (Mi[sq[0]]*sq[4] + Mi[sq[1]]*sq[5] + Mi[sq[2]]*sq[6] + Mi[sq[3]]*sq[7]) * (Math.min(1, e * 20) + 1e-6); if (wm < 1e-3) wm = 0; }
+              if (!two && ws === 0 && wm === 0) continue;
               let k = gain[i];
               if (useVig) { const dx = px + 0.5 - im.w / 2, dy = py + 0.5 - im.h / 2, r2 = (dx * dx + dy * dy) / ((im.w / 2) ** 2 + (im.h / 2) ** 2); k *= Math.exp(-(c1 * r2 + c2 * r2 * r2)); }
               const x0 = px | 0, y0 = py | 0, fx = px - x0, fy = py - y0, D = im.rgba;
@@ -522,8 +816,11 @@
                 for (let ch = 0; ch < 3; ch++) smp[ch] = (Ld[q00+ch]*v00 + Ld[q10+ch]*v10 + Ld[q01+ch]*v01 + Ld[q11+ch]*v11) * k;
                 lR += smp[0] * wf; lG += smp[1] * wf; lB += smp[2] * wf; lW += wf;
                 if (ws > 0) { hR += (R - smp[0]) * ws; hG += (Gc - smp[1]) * ws; hB += (B - smp[2]) * ws; hW += ws; }
-              } else { hR += R * ws; hG += Gc * ws; hB += B * ws; hW += ws; }
+                if (wm > 0) { mR += (R - smp[0]) * wm; mG += (Gc - smp[1]) * wm; mB += (B - smp[2]) * wm; mW += wm; }
+              } else { hR += R * ws; hG += Gc * ws; hB += B * ws; hW += ws; if (wm > 0) { mR += R * wm; mG += Gc * wm; mB += B * wm; mW += wm; } }
             }
+            // con costuras inteligentes: usar sus pesos si cubren el píxel; si no, el criterio de "la foto más centrada"
+            if (mW > 0.05) { hR = mR; hG = mG; hB = mB; hW = mW; }
             const o = (y * W + x) * 4;
             if (two && lW > 0) { out[o] = soft(lR / lW + (hW ? hR / hW : 0)); out[o+1] = soft(lG / lW + (hW ? hG / hW : 0)); out[o+2] = soft(lB / lW + (hW ? hB / hW : 0)); }
             else if (!two && hW > 0) { out[o] = soft(hR / hW); out[o+1] = soft(hG / hW); out[o+2] = soft(hB / hW); }
@@ -577,6 +874,7 @@
     const phot = photometric(job, F);
     stats.gains = phot.gain.map(g => +g.toFixed(3)); stats.vignette = phot.vig.map(v => +v.toFixed(3)); stats.blend = job.blend || 'twoband';
     const rgba = render(job, F, phot, progress);
+    if (job._seamStats) stats.seams = job._seamStats;
     stats.ms = Date.now() - t0;
     return { rgba, width: job.outW, height: job.outW / 2, stats };
   }
@@ -1338,12 +1636,14 @@ function finishStitch(m, secs, warn) {
   const c = document.createElement('canvas'); c.width = W; c.height = H;
   c.getContext('2d').putImageData(new ImageData(new Uint8ClampedArray(m.rgba), W, H), 0, 0);
   // small copy for the viewer
-  const pw = 2048, ph = 1024, pc = document.createElement('canvas'); pc.width = pw; pc.height = ph;
+  const pw = Math.min(4096, W), ph = pw / 2, pc = document.createElement('canvas'); pc.width = pw; pc.height = ph;
   const pctx = pc.getContext('2d'); pctx.drawImage(c, 0, 0, pw, ph);
   PANO = { canvas: c, W, H, prev: pctx.getImageData(0, 0, pw, ph), pw, ph, yaw: 0, pitch: 0, fov: 80 };
   const r = m.stats.refine || {};
   let info = `${W}×${H} · ${secs.toFixed(0)} s · `;
   info += r.ok ? `alineación afinada (error ${r.errBeforeDeg.toFixed(1)}° → ${r.errAfterDeg.toFixed(2)}°, ${r.used} puntos)` : `solo giroscopio (${r.reason || 'sin afinar'})`;
+  if (r.ok && r.errMeshDeg != null) info += ` · ajuste fino ${r.errMeshDeg.toFixed(2)}°`;
+  const sm = m.stats.seams; if (sm && sm.seamCostBefore > 0) info += ` · costuras −${Math.round((1 - sm.seamCostAfter / sm.seamCostBefore) * 100)}% de diferencia`;
   const vg = m.stats.vignette || [0, 0], fall = Math.round((1 - Math.exp(vg[0] + vg[1])) * 100);
   info += fall > 0 ? ` · viñeteo corregido (orillas −${fall}%)` : ' · sin corrección de viñeteo';
   if (cvSrc === 'cache') info += ' · motor guardado en el cel';
@@ -1370,10 +1670,14 @@ function drawViewer() {
       const d0 = fwd[0] + cx*rgt[0] + cy*up[0], d1 = fwd[1] + cx*rgt[1] + cy*up[1], d2 = fwd[2] + cx*rgt[2] + cy*up[2];
       const n = Math.hypot(d0, d1, d2);
       const lon = Math.atan2(d0, d1), lat = Math.asin(d2 / n);
-      let px = ((lon / (2 * Math.PI) + 0.5) * pw) | 0, py = ((0.5 - lat / Math.PI) * ph) | 0;
-      if (px >= pw) px = pw - 1; if (py >= ph) py = ph - 1; if (py < 0) py = 0;
-      const k = (py * pw + px) * 4;
-      out.data[o++] = P[k]; out.data[o++] = P[k+1]; out.data[o++] = P[k+2]; out.data[o++] = 255;
+      // bilineal (antes era el píxel más cercano y los bordes se veían en escalones)
+      const fx = (lon / (2 * Math.PI) + 0.5) * pw - 0.5, fy = Math.max(0, Math.min(ph - 1.001, (0.5 - lat / Math.PI) * ph - 0.5));
+      let x0 = Math.floor(fx); const ax = fx - x0, y0 = fy | 0, ay = fy - y0; x0 = (x0 + pw) % pw; const x1 = (x0 + 1) % pw;
+      const k00 = (y0 * pw + x0) * 4, k10 = (y0 * pw + x1) * 4, k01 = ((y0 + 1) * pw + x0) * 4, k11 = ((y0 + 1) * pw + x1) * 4;
+      const w00 = (1-ax)*(1-ay), w10 = ax*(1-ay), w01 = (1-ax)*ay, w11 = ax*ay;
+      out.data[o++] = P[k00]*w00 + P[k10]*w10 + P[k01]*w01 + P[k11]*w11;
+      out.data[o++] = P[k00+1]*w00 + P[k10+1]*w10 + P[k01+1]*w01 + P[k11+1]*w11;
+      out.data[o++] = P[k00+2]*w00 + P[k10+2]*w10 + P[k01+2]*w01 + P[k11+2]*w11; out.data[o++] = 255;
     }
   }
   ctx.putImageData(out, 0, 0);
