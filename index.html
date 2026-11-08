@@ -271,6 +271,8 @@
       </select>
       <span class="note">El tripié inclina menos el cel: el piso y el techo salen más centrados y con menos paralaje, a cambio de ~3 tomas más.</span></div>
     <div class="row"><label for="inOv">Traslape entre fotos <b id="ovVal">30</b><b>%</b></label><input id="inOv" type="range" min="20" max="45" value="30"></div>
+    <div class="row"><label for="inLensH">Altura del lente sobre el piso (m)</label><input id="inLensH" type="number" inputmode="decimal" min="0.5" max="3" step="0.05" value="1.5">
+      <span class="note">Mídela una vez con el cel puesto en el tripié. Sirve para decirte en centímetros qué tan lejos está el lente del eje de giro.</span></div>
     <div class="row"><label for="inTol">Tolerancia de alineación <b id="tolVal">3</b><b>°</b></label><input id="inTol" type="range" min="1" max="6" value="3"></div>
     <div class="row inline"><label for="inAuto">Disparo automático al alinear</label><input id="inAuto" type="checkbox" checked></div>
     <div class="row inline"><label for="inNadir">Incluir foto del piso (nadir)</label><input id="inNadir" type="checkbox"></div>
@@ -319,6 +321,7 @@
     <div id="stitchResult" style="display:none">
       <canvas id="viewer" width="480" height="640"></canvas>
       <p class="note" id="stitchInfo"></p>
+      <div id="lensInfo" style="margin:10px 0 14px;font-size:14px;line-height:1.45"></div>
       <div class="acciones-punto" style="margin-bottom:10px">
         <button id="btnJpg" class="primary ancho"><svg class="ico" style="vertical-align:-4px;margin-right:8px"><use href="#i-bajar"/></svg>Descargar JPG 360</button>
         <button id="btnShareJpg" class="ancho"><svg class="ico" style="vertical-align:-4px;margin-right:8px"><use href="#i-compartir"/></svg>Compartir JPG</button>
@@ -773,6 +776,7 @@
     // Ajuste fino local (malla flexible por foto) para absorber el paralaje que un giro rígido no puede corregir
     const evalHeld = () => held.length ? median(held.map(m => norm(resid(m, s, K).e))) * R2D : null;
     if (held.length) out.heldBeforeDeg = evalHeld();
+    if (job.lensOffset !== false) { try { out.lens = estimateLens(job, imgs, feats, active.concat(dense), s, K); } catch (e) { out.lens = { error: String(e && e.message || e) }; } }
     if (job.mesh !== false) {
       progress('Ajuste fino', 0.97);
       // se quedan solo los densos que el modelo rígido ya casi explica (lo demás son reflejos o cosas que se movieron)
@@ -790,6 +794,53 @@
   }
 
   // Gira todas las fotos para que el "arriba" de la esfera coincida con la gravedad medida en cada foto
+  // ---------- Posición del lente respecto al eje de giro (diagnóstico, no cambia la esfera) ----------
+  // Si el lente no está sobre el eje del tripié, cada foto se toma desde un punto un poco distinto (paralaje). Con el piso como
+  // referencia (plano a la altura del lente, dato del usuario) el desplazamiento se puede medir en cm: el centro de la cámara i es
+  // C_i = R_i·t, con t fijo en el marco del cel (r = derecha, u = arriba del cel, f = hacia la escena). Se ajustan t y pequeñas
+  // correcciones de giro con los pares de puntos del piso (modelo de plano) y el resto como giro puro con peso bajo.
+  function estimateLens(job, imgs, feats, list, s, K) {
+    const n = imgs.length, h = job.lensHeight || 1.5, SIN35 = Math.sin(35 * D2R);
+    const R0 = imgs.map(im => ({ r: im.r.slice(), u: im.u.slice(), f: im.f.slice() }));
+    const obs = list.filter(m => !imgs[m.i].skip && !imgs[m.j].skip).map(m => {
+      const A = feats[m.i], B = feats[m.j];
+      return { i: m.i, j: m.j, ca: camRay(m.ax, m.ay, A.gw, A.gh, A.F * s, K), cb: camRay(m.bx, m.by, B.gw, B.gh, B.F * s, K) };
+    });
+    const P = 3 + 3 * n, x = new Float64Array(P);
+    const pose = (i, v) => { const d = [v[3 + 3*i], v[4 + 3*i], v[5 + 3*i]], B = R0[i]; return { r: rotVec(d, B.r), u: rotVec(d, B.u), f: rotVec(d, B.f) }; };
+    const isFloor = o => toWorld(R0[o.i], o.ca)[2] < -SIN35 && toWorld(R0[o.j], o.cb)[2] < -SIN35;
+    let floor = obs.filter(isFloor); const other = obs.filter(o => !isFloor(o));
+    if (floor.length < 60) return { ok: false, reason: 'pocos puntos en el piso', floor: floor.length };
+    const res = (o, v, isF) => {
+      const Pi = pose(o.i, v), Pj = pose(o.j, v), a = toWorld(Pi, o.ca), b = toWorld(Pj, o.cb);
+      if (!isF) return [a[0]-b[0], a[1]-b[1], a[2]-b[2]];
+      const t = [v[0], v[1], v[2]], ci = toWorld(Pi, t), cj = toWorld(Pj, t);
+      if (a[2] > -0.05) return [0, 0, 0];
+      const lam = (-h - ci[2]) / a[2], X = [ci[0] + lam*a[0], ci[1] + lam*a[1], ci[2] + lam*a[2]], q = nz([X[0]-cj[0], X[1]-cj[1], X[2]-cj[2]]);
+      return [b[0]-q[0], b[1]-q[1], b[2]-q[2]];
+    };
+    const medDeg = (L, isF) => median(L.map(o => norm(res(o, x, isF)))) * R2D;
+    const before = medDeg(floor, true);
+    const huber = 0.003, wRot = 1 / Math.pow(2 * D2R, 2), wT = 1 / (0.3 * 0.3), sub = other.filter((o, k) => k % 3 === 0);
+    for (let it = 0; it < 10; it++) {
+      if (it === 4) { const es = floor.map(o => norm(res(o, x, true))), md = median(es); floor = floor.filter((o, k) => es[k] < Math.max(3 * md, 0.004)); }
+      const A = Array.from({ length: P }, () => new Float64Array(P)), b = new Float64Array(P);
+      const add = (o, isF, wBase) => {
+        const e = res(o, x, isF), en = norm(e), w = wBase * (1 / (0.002 * 0.002)) * (en > huber ? huber / en : 1);
+        const idx = isF ? [0, 1, 2] : []; for (const im of [o.i, o.j]) for (let k = 0; k < 3; k++) idx.push(3 + 3 * im + k);
+        const J = idx.map(p => { const xp = Float64Array.from(x); xp[p] += 1e-5; const e2 = res(o, xp, isF); return [(e2[0]-e[0])/1e-5, (e2[1]-e[1])/1e-5, (e2[2]-e[2])/1e-5]; });
+        for (let a1 = 0; a1 < idx.length; a1++) { b[idx[a1]] += w * dot(J[a1], e); for (let a2 = 0; a2 < idx.length; a2++) A[idx[a1]][idx[a2]] += w * dot(J[a1], J[a2]); }
+      };
+      for (const o of floor) add(o, true, 1);
+      for (const o of sub) add(o, false, 0.3);
+      for (let k = 0; k < 3; k++) { A[k][k] += wT; b[k] += wT * x[k]; }
+      for (let k = 3; k < P; k++) { A[k][k] += wRot; b[k] += wRot * x[k]; }
+      const dx = solve(A.map(r => Array.from(r)), Array.from(b).map(v => -v));
+      for (let k = 0; k < P; k++) x[k] += dx[k];
+    }
+    const after = medDeg(floor, true), cm = [x[0], x[1], x[2]].map(v => +(v * 100).toFixed(1));
+    return { ok: true, cm, rfu: 'r=derecha u=arriba del cel f=hacia la escena', dist: +(Math.hypot(x[0], x[1], x[2]) * 100).toFixed(1), floor: floor.length, floorErrBefore: +before.toFixed(3), floorErrAfter: +after.toFixed(3), h };
+  }
   function levelToGravity(imgs, grav, apply) {
     const up = C => { const z = [0, 0, 0]; return z; };
     const estimate = use => { const z = [0, 0, 0];
@@ -1356,7 +1407,7 @@ const S = {
   calib: null, wakeLock: null, audio: null, aeLocked: false,
   fovOverride: null, external: null, externalTotal: 0
 };
-const cfg = { longFov: 100, ov: 0.30, tol: 3, auto: true, nadir: false, pattern: 'tripod', lens: 'uw', res: 'max', autoLock: true, cam: {}, outW: 5760, refine: true };
+const cfg = { longFov: 100, ov: 0.30, tol: 3, auto: true, nadir: false, pattern: 'tripod', lens: 'uw', res: 'max', autoLock: true, cam: {}, outW: 5760, refine: true, lensH: 1.5 };
 try { Object.assign(cfg, JSON.parse(localStorage.getItem('guia360cfg') || '{}')); } catch (e) {}
 const saveCfg = () => { try { localStorage.setItem('guia360cfg', JSON.stringify(cfg)); } catch (e) {} };
 
@@ -1890,7 +1941,7 @@ async function buildZip() {
   const meta = {
     point: $('inPoint').value, created: new Date().toISOString(),
     camera: $('inCam').selectedOptions[0] ? $('inCam').selectedOptions[0].textContent : '',
-    hfov_deg: +H.toFixed(3), vfov_deg: +V.toFixed(3), overlap: cfg.ov, exposure_locked: S.aeLocked, yaw0_deg: +S.yaw0.toFixed(4),
+    hfov_deg: +H.toFixed(3), vfov_deg: +V.toFixed(3), overlap: cfg.ov, lens_height_m: cfg.lensH || 1.5, exposure_locked: S.aeLocked, yaw0_deg: +S.yaw0.toFixed(4),
     note: 'yaw relativo a la primera dirección (positivo = a la derecha), pitch positivo = arriba. f/r/u = adelante/derecha/arriba de la cámara en el mundo (x=Este, y=Norte, z=Arriba), sin restar yaw0_deg',
     shots: shotsMeta
   };
@@ -1917,6 +1968,19 @@ async function shareZip() {
   if (navigator.canShare && navigator.canShare({ files: [file] })) {
     try { await navigator.share({ files: [file], title: name }); } catch (e) {}
   } else { $('doneInfo').textContent = 'Compartir no está disponible en este navegador; usa Descargar ZIP.'; }
+}
+// Posición del lente respecto al eje de giro del tripié (ver estimateLens en el motor)
+function lensText(L) {
+  if (!L || !L.ok) return L && L.reason ? `Posición del lente: no se pudo medir (${L.reason}).` : '';
+  const [r, u, f] = L.cm, parts = [];
+  if (Math.abs(u) >= 1.5) parts.push(`${Math.abs(u).toFixed(0)} cm ${u > 0 ? 'arriba' : 'abajo'} del punto donde se inclina la cabeza del tripié`);
+  if (Math.abs(r) >= 1.5) parts.push(`${Math.abs(r).toFixed(0)} cm a la ${r > 0 ? 'derecha' : 'izquierda'} del eje (viendo la pantalla del cel)`);
+  if (Math.abs(f) >= 1.5) parts.push(`${Math.abs(f).toFixed(0)} cm ${f > 0 ? 'adelante' : 'atrás'} del eje`);
+  const ok = L.dist < 2.5;
+  return `<b>Lente respecto al eje de giro: ${ok ? 'bien colocado' : L.dist.toFixed(0) + ' cm'}</b><br>` +
+    (ok ? 'El lente gira prácticamente sobre sí mismo: casi no hay paralaje.'
+        : `El lente está ${parts.join(', ')}. Al girar se desplaza y lo cercano (piso, muebles) no empata del todo. Acércalo a ese punto y toma un punto de prueba para comprobar.`) +
+    `<br><span class="note">Calculado con la altura del lente de ${L.h} m (Ajustes); si la altura real es otra, la medida cambia en la misma proporción.</span>`;
 }
 function fillDoneInfo() {
   const mb = S.shots.reduce((a, s) => a + (s.blob ? s.blob.size : 0), 0) / 1048576, saving = S.shots.filter(s => !s.blob).length;
@@ -2009,7 +2073,7 @@ async function startStitch() {
     };
     stitchWorker.onerror = e => { setProg('Error en el proceso: ' + (e.message || 'memoria insuficiente'), 0); $('btnStitch').style.display = ''; if (stitchWorker) { stitchWorker.terminate(); stitchWorker = null; } };
     const cvUrls = cfg.refine ? await cvSources() : CV_URLS;
-    stitchWorker.postMessage({ outW, refine: cfg.refine, hfov: H, images, cvUrls }, transfer);
+    stitchWorker.postMessage({ outW, refine: cfg.refine, hfov: H, images, cvUrls, lensHeight: cfg.lensH || 1.5 }, transfer);
     if (cvUrls[0].startsWith('blob:')) setTimeout(() => URL.revokeObjectURL(cvUrls[0]), 120000);
   } catch (err) {
     setProg('Error: ' + (err.message || err), 0); $('btnStitch').style.display = '';
@@ -2035,6 +2099,7 @@ function finishStitch(m, secs, warn) {
   // Pocas coincidencias o error alto casi siempre es falta de traslape: lente distinto al configurado.
   if (r.ok && (r.used < 400 || r.errAfterDeg > 1.5)) info += ' · ⚠ las fotos casi no se traslapan: revisa que la cámara sea la ultra gran angular (0.5x) y vuelve a tomar el punto';
   $('stitchInfo').textContent = info;
+  $('lensInfo').innerHTML = lensText(r.lens);
   $('stitchProg').style.display = 'none'; $('stitchResult').style.display = '';
   $('btnStitch').style.display = ''; $('btnStitch').textContent = 'Volver a crear con otras opciones';
   // con resultado: el visor y la descarga suben; volver a crear queda como acción secundaria
@@ -2323,6 +2388,7 @@ $('inCam').onchange = async e => {
 $('inLens').onchange = e => { cfg.lens = e.target.value; if (LENS_FOV[cfg.lens]) { cfg.longFov = LENS_FOV[cfg.lens]; $('inFov').value = cfg.longFov; } saveCfg(); resetPoint(); };
 $('inFov').onchange = e => { cfg.longFov = Math.max(30, Math.min(130, +e.target.value || 100)); cfg.lens = 'custom'; $('inLens').value = 'custom'; saveCfg(); resetPoint(); };
 $('inOv').oninput = e => { cfg.ov = +e.target.value / 100; $('ovVal').textContent = e.target.value; saveCfg(); resetPoint(); };
+$('inLensH').onchange = e => { const v = +e.target.value; cfg.lensH = v >= 0.5 && v <= 3 ? v : 1.5; e.target.value = cfg.lensH; saveCfg(); };
 $('inTol').oninput = e => { cfg.tol = +e.target.value; $('tolVal').textContent = e.target.value; saveCfg(); };
 $('inAuto').onchange = e => { cfg.auto = e.target.checked; saveCfg(); };
 $('inNadir').onchange = e => { cfg.nadir = e.target.checked; saveCfg(); resetPoint(); };
@@ -2341,7 +2407,7 @@ $('inPattern').onchange = e => { cfg.pattern = e.target.value; saveCfg(); resetP
 $('inLens').value = cfg.lens; $('inFov').value = cfg.longFov;
 $('inOv').value = Math.round(cfg.ov * 100); $('ovVal').textContent = Math.round(cfg.ov * 100);
 $('inTol').value = cfg.tol; $('tolVal').textContent = cfg.tol;
-$('inAuto').checked = cfg.auto; $('inNadir').checked = cfg.nadir; $('inPattern').value = cfg.pattern === 'compact' ? 'compact' : 'tripod';
+$('inLensH').value = cfg.lensH || 1.5; $('inAuto').checked = cfg.auto; $('inNadir').checked = cfg.nadir; $('inPattern').value = cfg.pattern === 'compact' ? 'compact' : 'tripod';
 window.addEventListener('beforeunload', e => { if (S.shots.length) { e.preventDefault(); e.returnValue = ''; } });
 </script>
 </body>
