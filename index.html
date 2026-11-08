@@ -33,9 +33,14 @@
   #shoot.start { width:auto; height:56px; border-radius:16px; padding:0 22px; background:var(--ok); color:#002b18; border:0; }
   .side { min-width:92px; font-size:14px; padding:12px 10px; }
   #flash { position:fixed; inset:0; background:#fff; opacity:0; pointer-events:none; transition:opacity .25s; z-index:20; }
-  .sheet { position:fixed; left:0; right:0; bottom:0; max-height:86%; overflow:auto; background:var(--panel); backdrop-filter:blur(10px); border-radius:20px 20px 0 0; padding:18px 16px calc(env(safe-area-inset-bottom) + 18px); z-index:40; display:none; }
+  .sheet { position:fixed; left:0; right:0; bottom:0; max-height:86%; max-height:86dvh; overflow:auto; overscroll-behavior:contain; -webkit-overflow-scrolling:touch; background:var(--panel); backdrop-filter:blur(10px); border-radius:20px 20px 0 0; padding:0 16px calc(env(safe-area-inset-bottom) + 18px); z-index:40; display:none; }
   .sheet.open { display:block; }
-  .sheet h2 { margin:0 0 12px; font-size:19px; }
+  /* Encabezado fijo con ✕: siempre visible aunque el menú sea más largo que la pantalla */
+  .sheethead { position:sticky; top:0; z-index:2; display:flex; align-items:center; justify-content:space-between; gap:10px; margin:0 -16px 12px; padding:14px 12px 10px 16px; background:#121216; border-radius:20px 20px 0 0; border-bottom:1px solid #ffffff14; }
+  .sheethead h2 { margin:0; font-size:19px; }
+  .xbtn { flex:none; width:44px; height:44px; padding:0; border-radius:50%; font-size:20px; line-height:44px; background:#2a2a33; }
+  #backdrop { position:fixed; inset:0; z-index:39; background:#0006; display:none; }
+  #backdrop.open { display:block; }
   .row { display:flex; flex-direction:column; gap:6px; margin-bottom:14px; text-align:left; }
   .row label { font-size:13px; color:var(--mut); }
   .row input[type=text], .row input[type=number], .row select { font:inherit; padding:11px; border-radius:10px; border:1px solid #ffffff22; background:#1c1c22; color:var(--txt); }
@@ -101,8 +106,10 @@
   </div>
 </div>
 
+<div id="backdrop"></div>
+
 <div id="settings" class="sheet">
-  <h2>Ajustes</h2>
+  <div class="sheethead"><h2>Ajustes</h2><button class="xbtn" data-close="settings" aria-label="Cerrar">✕</button></div>
   <div class="row"><label>Nombre del punto</label><input id="inPoint" type="text" value="Punto 01"></div>
   <div class="row"><label>Cámara</label><select id="inCam"></select>
     <span class="note">Elige el gran angular (0.5x). En iPhone aparece como "Back Ultra Wide Camera"; en Samsung prueba cada "facing back" y quédate con la que se vea más abierta.</span></div>
@@ -126,7 +133,7 @@
 </div>
 
 <div id="camsheet" class="sheet">
-  <h2>Controles de cámara</h2>
+  <div class="sheethead"><h2>Controles de cámara</h2><button class="xbtn" data-close="camsheet" aria-label="Cerrar">✕</button></div>
   <div id="camControls"></div>
   <div class="ctl"><label>Resolución de captura</label>
     <select id="inRes">
@@ -140,7 +147,7 @@
 </div>
 
 <div id="done" class="sheet">
-  <h2 id="doneTitle">Punto completo</h2>
+  <div class="sheethead"><h2 id="doneTitle">Punto completo</h2><button class="xbtn" data-close="done" aria-label="Volver a la cámara">✕</button></div>
   <p class="note" id="doneInfo"></p>
 
   <div id="stitchBox">
@@ -1215,8 +1222,21 @@ async function sharePano() {
 }
 
 // ---------- UI wiring ----------
-function openSheet(id) { $(id).classList.add('open'); }
-function closeSheet(id) { $(id).classList.remove('open'); }
+// Menús: se cierran con ✕, tocando fuera del menú o con el botón "atrás" del cel (Android / gesto de iOS).
+const anySheetOpen = () => !!document.querySelector('.sheet.open');
+function syncBackdrop() { $('backdrop').classList.toggle('open', anySheetOpen()); }
+function openSheet(id) {
+  if (!anySheetOpen() && !(history.state && history.state.sheet)) { try { history.pushState({ sheet: 1 }, ''); } catch (e) {} }
+  $(id).classList.add('open'); $(id).scrollTop = 0; syncBackdrop();
+}
+function closeSheet(id) {
+  $(id).classList.remove('open'); syncBackdrop();
+  // Si ya no queda ningún menú abierto, quitar la entrada del historial (se revisa después porque a veces se abre otro enseguida)
+  setTimeout(() => { if (!anySheetOpen() && history.state && history.state.sheet) history.back(); }, 0);
+}
+window.addEventListener('popstate', () => { document.querySelectorAll('.sheet.open').forEach(s => s.classList.remove('open')); syncBackdrop(); });
+document.querySelectorAll('[data-close]').forEach(b => b.onclick = () => closeSheet(b.dataset.close));
+$('backdrop').onclick = () => document.querySelectorAll('.sheet.open').forEach(s => closeSheet(s.id));
 $('btnEnable').onclick = enable;
 $('shoot').onclick = () => { if (S.audio && S.audio.state === 'suspended') S.audio.resume(); if (!S.started) startPoint(); else if (S.captured.size === S.plan.targets.length) showDone(); else capture(-1); };
 $('btnUndo').onclick = undo;
