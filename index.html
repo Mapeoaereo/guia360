@@ -1398,6 +1398,7 @@ async function startPoint() {
   if (!pose) { $('hint').textContent = 'Esperando giroscopio…'; return; }
   clearExternal();
   S.yaw0 = pose.yaw; S.started = true; S.shots = []; S.captured = new Set(); resetStitchUI();
+  timing.waits = []; timing.grabs = []; timing.encs = []; S.alignFirst = null;
   dbClearPoint().then(dbSaveMeta);
   if (cfg.autoLock && !Object.keys(cfg.cam).length) {
     await setCameraMode('continuous');
@@ -1408,28 +1409,68 @@ async function startPoint() {
   $('shoot').classList.remove('start'); $('shoot').textContent = '';
   drawMinimapBase(); updateProgress(); beep(660);
 }
+// ---------- Guardado de fotos en segundo plano ----------
+// Antes, cada toma convertía el cuadro de 12 MP a JPEG en el hilo de la pantalla (~1 s en Android) y no dejaba
+// tomar la siguiente. Ahora se toma el cuadro al instante (ImageBitmap) y el JPEG se arma en un worker con OffscreenCanvas.
+// Si el navegador no lo permite, se usa canvas.toBlob como antes.
+const ENC_SRC = `self.onmessage = async e => { const { id, bmp, q } = e.data;
+  try { const c = new OffscreenCanvas(bmp.width, bmp.height); c.getContext('2d').drawImage(bmp, 0, 0); bmp.close();
+    const blob = await c.convertToBlob({ type: 'image/jpeg', quality: q }); self.postMessage({ id, blob }); }
+  catch (err) { self.postMessage({ id, err: String(err && err.message || err) }); } };`;
+let encWorker = null, encSeq = 0; const encWaiting = new Map();
+function encoderOk() { return typeof OffscreenCanvas !== 'undefined' && typeof createImageBitmap === 'function' && 'convertToBlob' in OffscreenCanvas.prototype; }
+function encodeInWorker(bmp) {
+  if (!encWorker) {
+    encWorker = new Worker(URL.createObjectURL(new Blob([ENC_SRC], { type: 'text/javascript' })));
+    encWorker.onmessage = e => { const w = encWaiting.get(e.data.id); if (!w) return; encWaiting.delete(e.data.id); e.data.blob ? w.res(e.data.blob) : w.rej(new Error(e.data.err)); };
+  }
+  const id = ++encSeq; return new Promise((res, rej) => { encWaiting.set(id, { res, rej }); encWorker.postMessage({ id, bmp, q: 0.92 }, [bmp]); });
+}
+async function grabFrame(w, h) { // devuelve { encode: () => Promise<Blob> } después de tomar el cuadro
+  if (encoderOk()) {
+    try { const bmp = await createImageBitmap(video); if (bmp.width === w && bmp.height === h) return { encode: () => encodeInWorker(bmp) }; bmp.close(); } catch (e) {}
+  }
+  const c = document.createElement('canvas'); c.width = w; c.height = h; c.getContext('2d').drawImage(video, 0, 0, w, h);
+  return { encode: () => new Promise(r => c.toBlob(r, 'image/jpeg', 0.92)) };
+}
+const whenShotsReady = () => Promise.all(S.shots.map(s => s.ready || Promise.resolve()));
+const timing = { waits: [], grabs: [], encs: [] };
+const avg = a => a.length ? a.reduce((x, y) => x + y, 0) / a.length : 0;
+
 async function capture(targetIdx) {
   if (S.busy) return;
   const pose = currentPose(); if (!pose) return;
   S.busy = true;
+  const tGrab = performance.now();
   try {
     const { w, h } = frameDims();
-    const c = document.createElement('canvas'); c.width = w; c.height = h;
-    c.getContext('2d').drawImage(video, 0, 0, w, h);
-    const blob = await new Promise(r => c.toBlob(r, 'image/jpeg', 0.92));
+    const frame = await grabFrame(w, h);
+    const grabMs = performance.now() - tGrab;
     if (targetIdx < 0) { // manual shot: assign to closest uncaptured target
       let best = -1, bd = 1e9;
       S.plan.targets.forEach((t, i) => { if (S.captured.has(i)) return; const d = angleBetween(pose.f, targetDir(t)); if (d < bd) { bd = d; best = i; } });
       targetIdx = best;
     }
-    S.shots.push({
+    const shot = {
       id: Date.now().toString(36) + Math.random().toString(36).slice(2, 7),
-      blob, width: w, height: h, target: targetIdx,
+      blob: null, width: w, height: h, target: targetIdx,
       yaw: wrap180(pose.yaw - S.yaw0), pitch: pose.pitch, roll: pose.roll,
       f: pose.f, r: pose.r, u: pose.u
-    });
+    };
+    S.shots.push(shot);
     if (targetIdx >= 0) S.captured.add(targetIdx);
-    dbSaveShot(S.shots[S.shots.length - 1], S.shots.length - 1);
+    // tiempos para diagnosticar: espera (desde que la marca quedó alineada hasta el disparo), captura y guardado
+    if (S.alignFirst && S.alignFirst.idx === targetIdx) timing.waits.push(performance.now() - S.alignFirst.t);
+    timing.grabs.push(grabMs); S.alignFirst = null;
+    const tEnc = performance.now();
+    shot.ready = frame.encode().then(blob => {
+      shot.blob = blob; timing.encs.push(performance.now() - tEnc);
+      if (S.shots.includes(shot)) dbSaveShot(shot, S.shots.indexOf(shot)); // si se deshizo mientras se guardaba, no se guarda
+    }).catch(err => { // no se pudo guardar: se quita la toma para que la marca la vuelva a pedir
+      console.warn('guardar foto', err);
+      const k = S.shots.indexOf(shot); if (k >= 0) { S.shots.splice(k, 1); if (shot.target >= 0) S.captured.delete(shot.target); }
+      $('hint').textContent = 'No se pudo guardar una foto; repítela'; drawMinimapBase(); updateProgress();
+    });
     if (PANO || stitchWorker) resetStitchUI();
     $('flash').style.opacity = .55; setTimeout(() => $('flash').style.opacity = 0, 90);
     if (navigator.vibrate) navigator.vibrate(40);
@@ -1559,6 +1600,7 @@ function loop(ts) {
     const p = project(pose, d, focal, cx, cy);
     const ang = angleBetween(pose.f, d);
     if (!S.captured.has(i) && ang < cfg.tol && (aligned < 0 || i === nxt)) aligned = i;
+    if (!S.captured.has(i) && ang < cfg.tol && !(S.alignFirst && S.alignFirst.idx === i)) S.alignFirst = { idx: i, t: performance.now() };
     if (p.behind || p.sx < -60 || p.sx > W + 60 || p.sy < -60 || p.sy > H + 60) return;
     if (S.captured.has(i)) {
       octx.fillStyle = 'rgba(46,229,157,.28)'; octx.strokeStyle = '#2ee59d'; octx.lineWidth = 2;
@@ -1652,6 +1694,7 @@ function endCalib() { S.calib = null; $('calib').classList.remove('open'); }
 
 // ---------- Export ----------
 async function buildZip() {
+  await whenShotsReady();
   const base = safeName($('inPoint').value);
   const files = [], shotsMeta = [];
   // sort: by target order so files follow the capture plan
@@ -1695,14 +1738,22 @@ async function shareZip() {
     try { await navigator.share({ files: [file], title: name }); } catch (e) {}
   } else { $('doneInfo').textContent = 'Compartir no está disponible en este navegador; usa Descargar ZIP.'; }
 }
+function fillDoneInfo() {
+  const mb = S.shots.reduce((a, s) => a + (s.blob ? s.blob.size : 0), 0) / 1048576, saving = S.shots.filter(s => !s.blob).length;
+  let txt = S.external
+    ? `${S.shots.length} fotos · ${mb.toFixed(1)} MB · ${S.external === 'zip' ? 'cargado desde el ZIP' : 'recuperado de la memoria del cel'}. Puedes crear la 360 y descargarla; para tomar más fotos, inicia un punto nuevo.`
+    : `${S.shots.length} fotos · ${mb.toFixed(1)} MB · exposición ${S.aeLocked ? 'bloqueada' : 'automática (puede variar entre fotos)'}`;
+  if (saving) txt += ` · guardando ${saving} ${saving === 1 ? 'foto' : 'fotos'}…`;
+  // tiempos por toma, para diagnosticar si la espera viene del giroscopio (alinear/quieto) o de guardar la foto
+  if (!S.external && timing.grabs.length) txt += ` · por toma: espera ${(avg(timing.waits) / 1000).toFixed(1)} s, captura ${(avg(timing.grabs) / 1000).toFixed(2)} s, guardado ${(avg(timing.encs) / 1000).toFixed(1)} s (en segundo plano)`;
+  $('doneInfo').textContent = txt;
+}
 function showDone() {
-  const mb = S.shots.reduce((a, s) => a + s.blob.size, 0) / 1048576;
   const total = S.external ? S.externalTotal : (S.plan ? S.plan.targets.length : S.shots.length);
   $('doneTitle').textContent = S.external === 'zip' ? 'Punto desde ZIP' : S.external === 'recover' ? 'Punto recuperado' : S.captured.size === total ? 'Punto completo' : 'Exportar punto';
   $('grpNext').style.display = S.external ? 'none' : '';
-  $('doneInfo').textContent = S.external
-    ? `${S.shots.length} fotos · ${mb.toFixed(1)} MB · ${S.external === 'zip' ? 'cargado desde el ZIP' : 'recuperado de la memoria del cel'}. Puedes crear la 360 y descargarla; para tomar más fotos, inicia un punto nuevo.`
-    : `${S.shots.length} fotos · ${mb.toFixed(1)} MB · exposición ${S.aeLocked ? 'bloqueada' : 'automática (puede variar entre fotos)'}`;
+  fillDoneInfo();
+  if (S.shots.some(s => !s.blob)) whenShotsReady().then(() => { if ($('done').classList.contains('open')) fillDoneInfo(); });
   openSheet('done'); beep(1040);
 }
 function nextPoint() {
@@ -1747,6 +1798,7 @@ async function startStitch() {
   const setProg = (stage, pct) => { $('stitchStage').textContent = stage; $('stitchBar').style.width = Math.round(Math.max(0, Math.min(1, pct)) * 100) + '%'; };
   setProg('Preparando fotos…', 0);
   try {
+    await whenShotsReady();
     const H = fovs().H, th = S.yaw0 * D2R, images = [], transfer = [];
     for (let i = 0; i < S.shots.length; i++) {
       const s = S.shots[i];
