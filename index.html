@@ -362,6 +362,7 @@
     const diag = imgs.map((im, i) => Math.atan(Math.hypot(im.w / 2, im.h / 2) / F[i]));
     const BS = 32, blockRad = Math.hypot(BS, BS) * (360 / W) * D2R;
     const holes = [40, 40, 44];
+    const seam = job.blend !== 'feather', tau = job.seamWidth || 0.03;
     for (let by = 0; by < H; by += BS) {
       for (let bx = 0; bx < W; bx += BS) {
         const cyaw = ((bx + BS / 2) / W * 360 - 180) * D2R, cp = (90 - (by + BS / 2) / H * 180) * D2R;
@@ -369,20 +370,31 @@
         const cand = [];
         for (let i = 0; i < n; i++) if (ang(cd, imgs[i].f) < diag[i] + blockRad) cand.push(i);
         const yEnd = Math.min(H, by + BS), xEnd = Math.min(W, bx + BS);
+        const nc = cand.length, cpx = new Float64Array(nc), cpy = new Float64Array(nc), ce = new Float64Array(nc);
         for (let y = by; y < yEnd; y++) {
           const p = (90 - (y + 0.5) / H * 180) * D2R, cpz = Math.cos(p), sp = Math.sin(p);
           for (let x = bx; x < xEnd; x++) {
             const yw = ((x + 0.5) / W * 360 - 180) * D2R;
             const d0 = cpz * Math.sin(yw), d1 = cpz * Math.cos(yw), d2 = sp;
-            let R = 0, Gc = 0, B = 0, Ws = 0;
-            for (const i of cand) {
-              const im = imgs[i];
+            let R = 0, Gc = 0, B = 0, Ws = 0, emax = -1;
+            // 1ª pasada: dónde cae el píxel en cada foto y qué tan lejos queda de su borde (e = 0 en el borde, 1 al centro)
+            for (let c = 0; c < nc; c++) {
+              const i = cand[c], im = imgs[i]; ce[c] = -1;
               const fz = im.f[0]*d0 + im.f[1]*d1 + im.f[2]*d2; if (fz <= 0.05) continue;
               const px = im.w / 2 + (im.r[0]*d0 + im.r[1]*d1 + im.r[2]*d2) / fz * F[i] - 0.5;
               const py = im.h / 2 - (im.u[0]*d0 + im.u[1]*d1 + im.u[2]*d2) / fz * F[i] - 0.5;
               if (px < 0 || py < 0 || px > im.w - 2 || py > im.h - 2) continue;
-              let e = Math.min(px + 0.5, im.w - 1.5 - px, py + 0.5, im.h - 1.5 - py) / (0.5 * Math.min(im.w, im.h));
-              const w = e * e * e + 1e-9;
+              const e = Math.min(px + 0.5, im.w - 1.5 - px, py + 0.5, im.h - 1.5 - py) / (0.5 * Math.min(im.w, im.h));
+              cpx[c] = px; cpy[c] = py; ce[c] = e; if (e > emax) emax = e;
+            }
+            // 2ª pasada: mezcla. 'seam' = casi una sola foto por zona (la que lo ve más al centro), transición angosta;
+            // evita la doble imagen cuando hay paralaje o desfase. 'feather' = promedio amplio (comportamiento anterior).
+            for (let c = 0; c < nc; c++) {
+              const e = ce[c]; if (e < 0) continue;
+              let w;
+              if (seam) { w = Math.exp((e - emax) / tau); if (w < 2e-3) continue; w *= Math.min(1, e * 20) + 1e-6; }
+              else w = e * e * e + 1e-9;
+              const i = cand[c], im = imgs[i], px = cpx[c], py = cpy[c];
               const x0 = px | 0, y0 = py | 0, fx = px - x0, fy = py - y0, D = im.rgba;
               const k00 = (y0 * im.w + x0) * 4, k10 = k00 + 4, k01 = k00 + im.w * 4, k11 = k01 + 4;
               const w00 = (1-fx)*(1-fy), w10 = fx*(1-fy), w01 = (1-fx)*fy, w11 = fx*fy, g = gain[i] * w;
